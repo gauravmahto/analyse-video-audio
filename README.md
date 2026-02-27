@@ -2,6 +2,14 @@
 
 Analyze screen-recorded videos by combining audio transcription (Whisper) with visual frame understanding (Qwen3-VL via an OpenAI-compatible API).
 
+**Key Features:**
+
+- **Perceptual Hashing (pHash)**: Deduplicates visually identical frames, reducing API calls by 60-80% on typical screen recordings.
+- **Content-Addressable Cache (CAS)**: Never re-process the same video twice; cache keys are based on file SHA-256 hashes.
+- **Distributed Parallel Inference**: Load-balance frame processing across multiple LLM server instances.
+- **Anti-Hallucination Whisper Fixes**: Prevents the "Yeah Yeah Yeah" loops during silent sections.
+- **Long-form Timestamps**: Handles videos longer than 1 hour correctly.
+
 ## What's here
 
 - `analyze_pipeline.py`: main multimodal pipeline with content-hash cache and a final synthesis step.
@@ -14,11 +22,13 @@ Analyze screen-recorded videos by combining audio transcription (Whisper) with v
 - Python packages:
   - `openai-whisper`
   - `requests`
+  - `imagehash`
+  - `Pillow`
 
 ## Install
 
 ```bash
-pip install -U openai-whisper requests
+pip install -U openai-whisper requests imagehash Pillow
 ```
 
 ### LLM server (llama.cpp)
@@ -82,6 +92,12 @@ python analyze_pipeline.py --video path/to/video.mkv --audio-type wav
 python analyze_pipeline.py --video path/to/video.mp4 --api-url http://127.0.0.1:8033/v1/chat/completions
 ```
 
+### Distributed parallel inference (multiple servers)
+
+```bash
+python analyze_pipeline.py --video path/to/video.mp4 --api-urls http://127.0.0.1:8033/v1/chat/completions http://127.0.0.1:8034/v1/chat/completions
+```
+
 ### Clear cache for a file
 
 ```bash
@@ -109,8 +125,10 @@ python analyze-v2.py --video path/to/video.mp4 --fps 1 --do_vlm --frame_limit 50
 - `ffmpeg` not found: confirm it's on PATH (`ffmpeg -version`). Reopen the terminal after install.
 - Whisper downloads are slow: ensure a stable network and try a smaller model (e.g., `base`).
 - LLM endpoint errors: verify the `--api-url` is reachable and the model name is `qwen3-vl`.
+- Missing `imagehash` or `Pillow`: Install them with `pip install imagehash Pillow`.
 
 ## Notes
 
 - The visual pipeline sends frames to a VLM using the OpenAI-compatible endpoint in `--api-url` and expects a model named `qwen3-vl`.
+- pHash threshold tuning: Edit `PHASH_THRESHOLD` in `analyze_pipeline.py` (default: 5). Higher values = fewer API calls but risk missing fine details.
 - `analyze-v2.py` defaults to the same `video1822201159.mp4` and uses `.pipeline_cache` plus `.pipeline_runs` for per-run logs.
