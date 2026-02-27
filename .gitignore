@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+
+# Logs and outputs
+*.log
+*.txt
+
+# Media and extracted frames
+*.mp4
+frames/
+extracted_frames/
+
+# Pipelines/cache
+.pipeline_cache/
+
+debug_summary*
