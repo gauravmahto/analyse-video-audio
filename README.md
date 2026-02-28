@@ -5,12 +5,13 @@ Analyze screen-recorded videos by combining audio transcription (Whisper) with v
 **Key Features:**
 
 - **Perceptual Hashing (pHash/dHash)**: Deduplicates visually identical frames, reducing API calls by 60-80% on typical screen recordings.
+- **Fuzzy Text Compression**: Intelligently drops repetitive visual states using similarity matching (85% threshold), further reducing synthesis token costs.
 - **Global Frame CAS**: Cross-video caching prevents re-processing identical frames across different videos.
 - **Content-Addressable Cache**: Never re-process the same video twice; cache keys are based on file SHA-256 hashes.
 - **Coordinator/Worker Cluster Inference**: Main servers handle synthesis while secondary servers process frame analysis with per-server slot configurations.
 - **JSON Manifests & Metadata**: Comprehensive tracking of frame selection, cluster performance, and run parameters.
 - **Stateful Time Tracking**: Accurately recovers elapsed time even after force-quits or restarts.
-- **Network Hardened**: Automatic retries with exponential backoff and request timeouts for reliable distributed inference.
+- **Network Hardened**: Automatic retries with exponential backoff and configurable timeouts for reliable distributed inference.
 - **Anti-Hallucination Whisper Fixes**: Prevents the "Yeah Yeah Yeah" loops during silent sections.
 - **Long-form Timestamps**: Handles videos longer than 1 hour correctly.
 - **Live Terminal Dashboard**: Rich-based 2-column active processing UI for frame routing and completion.
@@ -22,10 +23,12 @@ Analyze screen-recorded videos by combining audio transcription (Whisper) with v
 
 - **`analyze_pipeline.py`** (Recommended for most users)
   - Fast parallel frame analysis with perceptual hashing (pHash)
+  - Fuzzy Text Compression: automatically drops repetitive visual states (85% similarity threshold)
   - Global Frame CAS: cross-video caching of frame analyses
   - JSON manifests for frame selection and cluster performance tracking
   - Distributed inference across multiple LLM servers with per-server slot configurations
   - Stateful elapsed time tracking (survives restarts)
+  - Configurable synthesis timeout for long-running final analysis
   - Real-time diagnostic tuning with `--tune-phash`
   - Best for: quick iteration, UI recordings, cost optimization
 
@@ -152,6 +155,16 @@ python analyze_pipeline.py --video path/to/crash_log.mp4 --adaptive-spike --phas
 ```
 
 This captures N additional frames after each detected change (spike window), useful for terminal sessions.
+
+### Custom synthesis timeout (for large videos)
+
+For very long recordings that generate extensive transcripts and visual logs:
+
+```bash
+python analyze_pipeline.py --video path/to/long_video.mp4 --synthesis-timeout 3600
+```
+
+Default timeout is 1800 seconds (30 minutes). Increase for hour-long+ recordings.
 
 ### Clear cache
 
@@ -298,6 +311,8 @@ FRAME_LIMIT = 100               # Limit to first N frames (0 = all)
 - LLM endpoint errors: verify `--main-urls` / `--secondary-urls` are reachable and model is `qwen3-vl`.
 - Missing `imagehash` or `Pillow`: Install them with `pip install imagehash Pillow`.
 - Missing Rich UI: install with `pip install rich`.
+- **Synthesis timeout errors**: If synthesis fails with timeout, increase with `--synthesis-timeout 3600` (especially for hour+ videos).
+- **Empty final summary**: Check logs for VLM failures. Fuzzy compression may drop all states if they're too repetitive—verify frame selection JSON.
 
 ## Which pipeline should I use?
 
@@ -307,9 +322,11 @@ FRAME_LIMIT = 100               # Limit to first N frames (0 = all)
 | Ease of use         | ✅ Recommended                        | Advanced                                       |
 | Frame filtering     | pHash                                 | pHash or dHash (switchable)                    |
 | Hash mode switching | No                                    | ✅ `--hash-mode phash/dhash`                   |
+| Fuzzy text compress | ✅ 85% similarity auto-dedup          | No (manual compression only)                   |
 | Tuning              | `--tune-phash`                        | `--tune-hash`                                  |
 | Cluster mode        | ✅ `--main-urls` + `--secondary-urls` | ✅ `--main-urls` + `--secondary-urls`          |
 | Per-server slots    | ✅ `URL:N` syntax                     | ✅ `URL:N` syntax                              |
+| Synthesis timeout   | ✅ `--synthesis-timeout`              | ✅ `--timeout`                                 |
 | Caching             | Per-file + Global Frame CAS           | Per-step CAS + Global Frame CAS                |
 | JSON metadata       | ✅ Manifests + cluster stats          | ✅ Full run metadata + performance tracking    |
 | Stateful time track | ✅ Survives restarts                  | ✅ Survives restarts                           |
@@ -322,6 +339,7 @@ FRAME_LIMIT = 100               # Limit to first N frames (0 = all)
 - Both pipelines expect `qwen3-vl` model when using VLM.
 - **Content-based caching**: Videos identified by SHA-256 hash, not filename. Prevents re-processing renamed files.
 - **Global Frame CAS**: Both pipelines cache frame analyses across videos, preventing redundant API calls for identical frames.
+- **Fuzzy Text Compression** (`analyze_pipeline.py` only): Uses `difflib.SequenceMatcher` to compare consecutive VLM outputs. If two states are ≥85% similar, the duplicate is dropped. This can reduce synthesis prompt size by 30-50% on static UI recordings.
 - **pHash vs dHash**:
   - pHash: More robust under compression, recommended for screen recordings (both pipelines)
   - dHash: Faster computation, good for UI recordings (`analyze_video_pipeline_full.py` only)
@@ -332,3 +350,4 @@ FRAME_LIMIT = 100               # Limit to first N frames (0 = all)
   - Silent/mostly static videos: `--threshold 6-8` (fewer API calls)
   - UI/terminal with moderate activity: `--threshold 5` (default, balanced)
   - Fast scrolling/coding sessions: `--threshold 3-4` with `--adaptive-spike` (more frames)
+- **Synthesis timeout**: Default is 1800s (30 min). For hour-long videos with extensive logs, use `--synthesis-timeout 3600` or higher.

@@ -13,6 +13,7 @@ Key Features:
 - Stateful Time Tracking: Recovers execution time accurately even after force-quits (Ctrl+C).
 - Audio Hallucination Fix: Aggressive silence suppression for terminal recordings.
 - Intelligent pHash Deduplication: Uses Perceptual Hashing to drop identical video frames.
+- Fuzzy Text Compression: Slides a similarity window over VLM outputs to drop repetitive states.
 - Coordinator/Worker Inference: True Dynamic Load Balancing across cluster machines.
 - Per-Server Slot Configurations: Dynamically allocate GPU slots per machine (e.g., URL:4).
 - Network Hardened: Automatic retries with exponential backoff and request timeouts.
@@ -35,6 +36,7 @@ import sys
 import threading
 import queue
 import json  # Added for manifest generation
+import difflib  # Added for Fuzzy Text Compression
 
 # --- Image Processing Imports ---
 from PIL import Image
@@ -135,13 +137,13 @@ def format_duration(seconds):
     return f"{m:02d}m {s:02d}s"
 
 
-def robust_api_call(url, payload, max_retries=3):
+def robust_api_call(url, payload, max_retries=3, timeout=180):
     """Network hardened API call with performance telemetry (Tokens/Second)."""
     for attempt in range(max_retries):
         try:
             start_time = time.time()
             response = requests.post(
-                url, headers={"Content-Type": "application/json"}, json=payload, timeout=180)
+                url, headers={"Content-Type": "application/json"}, json=payload, timeout=timeout)
 
             # If the server throws a 400 or 500 error, this triggers the exception
             response.raise_for_status()
@@ -676,7 +678,7 @@ def get_visual_log(paths, video_path, cluster_nodes, threshold=5, fps=1, adaptiv
     return visual_log
 
 
-def synthesize_timeline(transcript, visual_log, synthesis_api_url, model_name="qwen3-vl"):
+def synthesize_timeline(transcript, visual_log, synthesis_api_url, model_name="qwen3-vl", timeout=1800):
     """Synthesizes the audio transcript and visual logs into a final cohesive summary."""
     logger.info(
         f"Executing Synthesis Phase on Coordinator Server ({synthesis_api_url})...")
@@ -688,14 +690,21 @@ def synthesize_timeline(transcript, visual_log, synthesis_api_url, model_name="q
         for line in visual_log:
             try:
                 state_only = line.split("] Visual State: ")[1]
-                if state_only != last_state:
+
+                # --- FUZZY COMPRESSION ENABLED ---
+                # Compares the new string to the last string. If they are >= 85% similar, we drop the new one.
+                similarity = difflib.SequenceMatcher(
+                    None, state_only, last_state).ratio()
+
+                if similarity < 0.85:
                     compressed_log.append(line)
                     last_state = state_only
+
             except IndexError:
                 compressed_log.append(line)
 
         logger.info(
-            f"Text compression dropped visual log from {len(visual_log)} down to {len(compressed_log)} unique states.")
+            f"Fuzzy Text Compression dropped visual log from {len(visual_log)} down to {len(compressed_log)} critical state changes.")
 
     visual_text = "\n".join(compressed_log) if compressed_log else "None"
 
@@ -727,7 +736,9 @@ def synthesize_timeline(transcript, visual_log, synthesis_api_url, model_name="q
         logger.info(
             "Sending compressed timelines to model for final synthesis. This may take a minute or two...")
 
-        analysis, stats = robust_api_call(synthesis_api_url, payload)
+        # --- DYNAMIC TIMEOUT INJECTION ---
+        analysis, stats = robust_api_call(
+            synthesis_api_url, payload, timeout=timeout)
 
         logger.info(f"✅ Synthesis complete on {synthesis_api_url}")
         logger.info(
@@ -752,6 +763,10 @@ def main():
 
     parser.add_argument("--model", type=str, default="qwen3-vl",
                         help="The model name expected by the API endpoint (default: qwen3-vl)")
+
+    # --- NEW: CONFIGURABLE TIMEOUT ---
+    parser.add_argument("--synthesis-timeout", type=int, default=1800,
+                        help="Timeout in seconds for the final synthesis API call (default: 1800).")
 
     parser.add_argument("--audio-only", action="store_true",
                         help="Only process audio, skipping visual pipeline")
@@ -858,8 +873,9 @@ def main():
             model_name=args.model
         )
 
+    # --- DYNAMIC TIMEOUT INJECTION ---
     final_analysis = synthesize_timeline(
-        transcript, visual_log, synthesis_url, model_name=args.model)
+        transcript, visual_log, synthesis_url, model_name=args.model, timeout=args.synthesis_timeout)
 
     with open(paths["final_analysis"], "w") as f:
         f.write(final_analysis)
