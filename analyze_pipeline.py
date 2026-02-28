@@ -9,8 +9,10 @@ Key Features:
 - Content-Addressable Cache (CAS): Prevents re-processing identical videos.
 - Audio Hallucination Fix: Prevents Whisper from looping during silence.
 - Intelligent pHash Deduplication: Uses Perceptual Hashing to drop identical video frames.
-- Distributed Inference: Supports load-balancing across multiple LLM server instances.
+- Coordinator/Worker Inference: Splits heavy text tasks and lightweight image tasks across machines.
 - pHash Tuner: Built-in diagnostic tool to calibrate frame filtering sensitivity.
+- Live Terminal UI: 2-column active processing dashboard.
+- Organized Outputs: Automatically routes summaries to /output and logs to /logs with dynamic hashing.
 
 ==============================================================================
 CLI USAGE EXAMPLES
@@ -18,18 +20,20 @@ CLI USAGE EXAMPLES
 1. Standard Analysis (Strict Deduplication - Best for UI, Jira, Webcams)
    python analyze_pipeline.py --video bug_report.mp4
 
-2. Adaptive Spike Mode (Best for fast-scrolling terminal logs)
-   python analyze_pipeline.py --video server_crash.mp4 --adaptive-spike
+2. Distributed Cluster Mode (Main handles text + images, Secondary handles ONLY images)
+   python analyze_pipeline.py --video bug_report.mp4 \
+     --main-urls http://192.168.1.50:8033/v1/chat/completions \
+     --secondary-urls http://127.0.0.1:8033/v1/chat/completions
 
-3. Tune the Perceptual Hash (Dry-run diagnostic)
-   python analyze_pipeline.py --video bug_report.mp4 --tune-phash --phash-threshold 5 --tune-limit 100
+3. Adaptive Spike Mode (Best for fast-scrolling terminal logs)
+   python analyze_pipeline.py --video server_crash.mp4 --adaptive-spike
 ==============================================================================
 """
 
+import os
 import subprocess
 import base64
 import requests
-import os
 import glob
 import time
 import whisper
@@ -39,42 +43,43 @@ import argparse
 import shutil
 import concurrent.futures
 import sys
+import threading
 
 # --- Image Processing Imports ---
 from PIL import Image
 import imagehash
+
+# --- Live UI Imports ---
+from rich.live import Live
+from rich.table import Table
 
 # --- Global Defaults ---
 VIDEO_PATH = "video1822201159.mp4"
 LLAMA_API_URL = "http://127.0.0.1:8033/v1/chat/completions"
 BASE_CACHE_DIR = ".pipeline_cache"
 
-# --- Setup Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler("pipeline_execution.log"),
-        logging.StreamHandler()
-    ]
-)
+# --- Setup Base Logging (Console Only Initially) ---
+os.makedirs("logs", exist_ok=True)
+
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 
 def get_file_hash(filepath, chunk_size=8 * 1024 * 1024):
     """Generates a SHA-256 hash of a file's binary content for CAS caching."""
-    logger.info(f"Calculating SHA-256 hash for {filepath}...")
     hasher = hashlib.sha256()
     try:
         with open(filepath, 'rb') as f:
             for chunk in iter(lambda: f.read(chunk_size), b''):
                 hasher.update(chunk)
-        file_hash = hasher.hexdigest()
-        logger.info(f"Media signature (Hash): {file_hash}")
-        return file_hash
+        return hasher.hexdigest()
     except FileNotFoundError:
-        logger.error(f"File not found: {filepath}")
-        sys.exit(1)
+        return None
 
 
 def setup_cache(video_hash, audio_type):
@@ -94,10 +99,7 @@ def setup_cache(video_hash, audio_type):
 
 
 def tune_phash_diagnostic(frames_dir, threshold, limit=50, output_file=None, adaptive_spike=False):
-    """
-    Diagnostic Tool: Scans a directory of sequential frames and prints the pHash 
-    distance to help tune the threshold. Mirrors the exact logic of the visual pipeline.
-    """
+    """Diagnostic Tool: Scans a directory of sequential frames and prints the pHash distance."""
     frames = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
 
     if not frames:
@@ -146,7 +148,6 @@ def tune_phash_diagnostic(frames_dir, threshold, limit=50, output_file=None, ada
 
         distance = current_hash - last_hash
 
-        # UNIFIED LOGIC BLOCK
         if distance > threshold:
             action = "🟢 KEPT (Change Spike)"
             last_hash = current_hash
@@ -228,8 +229,8 @@ def get_transcript(paths, video_path):
     return transcript
 
 
-def get_visual_log(paths, video_path, api_urls, threshold=5, fps=1, adaptive_spike=False):
-    """Extracts frames, filters via pHash, and distributes to LLM instances."""
+def get_visual_log(paths, video_path, cluster_urls, threshold=5, fps=1, adaptive_spike=False):
+    """Extracts frames, filters via pHash, and distributes to ALL cluster URLs in parallel."""
     if os.path.exists(paths["visual_log"]) and os.path.getsize(paths["visual_log"]) > 0:
         logger.info(
             "Visual log cache hit. Skipping FFmpeg and Qwen3-VL analysis.")
@@ -272,7 +273,6 @@ def get_visual_log(paths, video_path, api_urls, threshold=5, fps=1, adaptive_spi
 
         distance = current_hash - last_hash
 
-        # UNIFIED LOGIC BLOCK
         if distance > threshold:
             target_frames.append(frame_path)
             last_hash = current_hash
@@ -297,20 +297,48 @@ def get_visual_log(paths, video_path, api_urls, threshold=5, fps=1, adaptive_spi
     logger.info(
         f"pHash Dedupe complete. Dropped {compression_ratio}% of redundant frames.")
     logger.info(
-        f"Distributing {total_targets} critical frames across {len(api_urls)} servers...")
+        f"Distributing {total_targets} critical frames across {len(cluster_urls)} servers in cluster...")
+
+    # --- LIVE 2-COLUMN DASHBOARD SETUP ---
+    active_status = {url: "Idle" for url in cluster_urls}
+    completed_log = []
+    status_lock = threading.Lock()
+
+    def generate_table():
+        """Generates the Rich UI Table dynamically"""
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("✅ Completed Frames", style="dim green", width=50)
+        table.add_column("⏳ Active Processing", style="yellow", width=50)
+
+        num_rows = max(len(cluster_urls), 5)
+
+        with status_lock:
+            recent_completed = completed_log[-num_rows:]
+            while len(recent_completed) < num_rows:
+                recent_completed.insert(0, "")
+
+            active_list = [
+                f"[{url.split('//')[-1].split('/')[0]}] {task}" for url, task in active_status.items()]
+            while len(active_list) < num_rows:
+                active_list.append("")
+
+            for comp, act in zip(recent_completed, active_list):
+                table.add_row(comp, act)
+
+        return table
 
     def process_frame(task_data):
         index, frame_path, target_url = task_data
         server_short = target_url.split('//')[-1].split('/')[0]
+        fname = os.path.basename(frame_path)
 
-        logger.info(
-            f"[{index}/{total_targets}] Routing {os.path.basename(frame_path)} to {server_short}...")
+        with status_lock:
+            active_status[target_url] = f"{fname} ({index}/{total_targets})"
 
         with open(frame_path, "rb") as image_file:
             base64_image = base64.b64encode(image_file.read()).decode('utf-8')
 
-        frame_num = int(os.path.basename(frame_path).replace(
-            "frame_", "").replace(".jpg", ""))
+        frame_num = int(fname.replace("frame_", "").replace(".jpg", ""))
         timestamp = time.strftime('%M:%S', time.gmtime(frame_num))
 
         payload = {
@@ -333,24 +361,40 @@ def get_visual_log(paths, video_path, api_urls, threshold=5, fps=1, adaptive_spi
                                      "Content-Type": "application/json"}, json=payload)
             response.raise_for_status()
             analysis = response.json()["choices"][0]["message"]["content"]
+
+            with status_lock:
+                active_status[target_url] = "Idle"
+                completed_log.append(f"{fname} -> {server_short} (Success)")
+
             return f"[{timestamp}] Visual State: {analysis.strip()}"
         except Exception as e:
-            logger.error(
-                f"Error processing {frame_path} on {server_short}: {e}")
+            with status_lock:
+                active_status[target_url] = "Idle"
+                completed_log.append(f"{fname} -> {server_short} (FAILED)")
             return f"[{timestamp}] Visual State: Error processing frame."
 
     tasks = []
     for i, frame in enumerate(target_frames, 1):
-        target_url = api_urls[i % len(api_urls)]
+        target_url = cluster_urls[i % len(cluster_urls)]
         tasks.append((i, frame, target_url))
 
     visual_log = []
-    max_concurrent = len(api_urls) * 2
+    max_concurrent = len(cluster_urls) * 2
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-        results = executor.map(process_frame, tasks)
-        for res in results:
-            visual_log.append(res)
+    # Disable standard logger temporarily so it doesn't break the Rich table
+    if console_handler in logger.handlers:
+        logger.removeHandler(console_handler)
+
+    print("\n")
+
+    with Live(get_renderable=generate_table, refresh_per_second=10) as live:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            results = executor.map(process_frame, tasks)
+            for res in results:
+                visual_log.append(res)
+
+    if console_handler not in logger.handlers:
+        logger.addHandler(console_handler)
 
     logger.info("Distributed visual pipeline completed.")
 
@@ -361,9 +405,10 @@ def get_visual_log(paths, video_path, api_urls, threshold=5, fps=1, adaptive_spi
     return visual_log
 
 
-def synthesize_timeline(transcript, visual_log, api_url):
+def synthesize_timeline(transcript, visual_log, synthesis_api_url):
     """Synthesizes the audio transcript and visual logs into a final cohesive summary."""
-    logger.info("Executing Synthesis Phase (Non-Idempotent)...")
+    logger.info(
+        f"Executing Synthesis Phase on Coordinator Server ({synthesis_api_url})...")
 
     compressed_log = []
     last_state = ""
@@ -409,8 +454,8 @@ def synthesize_timeline(transcript, visual_log, api_url):
     try:
         logger.info(
             "Sending compressed timelines to model for final synthesis. This may take a minute or two...")
-        response = requests.post(
-            api_url, headers={"Content-Type": "application/json"}, json=payload)
+        response = requests.post(synthesis_api_url, headers={
+                                 "Content-Type": "application/json"}, json=payload)
         response.raise_for_status()
         logger.info("Synthesis complete.")
         return response.json()["choices"][0]["message"]["content"]
@@ -428,8 +473,13 @@ def main():
         description="Multimodal Video Debugging Analysis")
     parser.add_argument("--video", type=str, default=VIDEO_PATH,
                         help="Path to the video or audio file")
-    parser.add_argument("--api-urls", type=str, nargs='+', default=[LLAMA_API_URL],
-                        help="One or more LLM API Endpoint URLs separated by spaces for load balancing")
+
+    # --- CLUSTER ARGUMENTS ---
+    parser.add_argument("--main-urls", type=str, nargs='+', default=[LLAMA_API_URL],
+                        help="Primary LLM servers. The FIRST one will be used for the final heavy text synthesis.")
+    parser.add_argument("--secondary-urls", type=str, nargs='*', default=[],
+                        help="Worker LLM servers used ONLY for parallel image processing.")
+
     parser.add_argument("--audio-only", action="store_true",
                         help="Only process audio, skipping visual pipeline")
     parser.add_argument("--audio-type", type=str,
@@ -444,26 +494,47 @@ def main():
                         help="Dry-run diagnostic mode. Prints a table of frame distances to help tune the threshold.")
     parser.add_argument("--tune-limit", type=int, default=50,
                         help="Number of frames to analyze during --tune-phash. Set to 0 to analyze all frames (default: 50)")
-
-    # --- NEW: Adaptive Spike Toggle ---
     parser.add_argument("--adaptive-spike", action="store_true",
                         help="Enable spike memory to capture sequential frames after a change (Best for scrolling terminals)")
 
     args = parser.parse_args()
+    cluster_urls = args.main_urls + args.secondary_urls
 
-    logger.info("=== Starting Multimodal Pipeline Execution ===")
-    logger.info(f"Target Media: {args.video}")
-    if not args.tune_phash:
-        logger.info(f"Active LLM Servers: {len(args.api_urls)} instance(s)")
-    if args.audio_only:
-        logger.info("MODE: AUDIO-ONLY")
-
+    # 1. Determine paths and basenames
+    video_basename = os.path.splitext(os.path.basename(args.video))[0]
     input_ext = os.path.splitext(args.video)[1].lower().strip('.')
     if not input_ext:
         input_ext = "m4a"
-
     target_audio_type = args.audio_type if args.audio_type else input_ext
+
+    # 2. Calculate the Hash silently
     video_hash = get_file_hash(args.video)
+    if not video_hash:
+        logger.error(f"❌ File not found: {args.video}")
+        sys.exit(1)
+
+    # 3. Add dynamic FileHandler now that we have the hash
+    log_filename = os.path.join(
+        "logs", f"pipeline_{video_basename}_{video_hash[:8]}.log")
+    file_handler = logging.FileHandler(log_filename)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # 4. Now begin emitting logs (they will go to console AND the new dynamic file)
+    logger.info("=== Starting Multimodal Pipeline Execution ===")
+    logger.info(f"Target Media: {args.video}")
+    logger.info(f"Media signature (Hash): {video_hash}")
+
+    if not args.tune_phash:
+        logger.info(
+            f"Cluster Size: {len(cluster_urls)} total instances ({len(args.main_urls)} Main, {len(args.secondary_urls)} Secondary)")
+        logger.info(f"Synthesis Coordinator: {args.main_urls[0]}")
+    if args.audio_only:
+        logger.info("MODE: AUDIO-ONLY")
+
+    # Setup the structured output directory for this specific video
+    output_dir = os.path.join("output", video_basename)
+    os.makedirs(output_dir, exist_ok=True)
 
     if args.clear_cache:
         cache_dir_to_clear = os.path.join(BASE_CACHE_DIR, video_hash)
@@ -475,7 +546,6 @@ def main():
 
     paths = setup_cache(video_hash, target_audio_type)
 
-    # --- Run the Diagnostic Tuner if requested ---
     if args.tune_phash:
         logger.info("MODE: pHash Tuning Diagnostic")
 
@@ -486,13 +556,15 @@ def main():
             subprocess.run(command, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL)
 
-        tuning_report_file = f"phash_tuning_report_{video_hash[:8]}.log"
+        # Route tuning log securely to the /logs folder
+        tuning_report_file = os.path.join(
+            "logs", f"phash_tuning_report_{video_basename}_{video_hash[:8]}.log")
         tune_phash_diagnostic(
             paths['frames_dir'],
             args.phash_threshold,
             args.tune_limit,
             output_file=tuning_report_file,
-            adaptive_spike=args.adaptive_spike  # <-- Pass the toggle
+            adaptive_spike=args.adaptive_spike
         )
         sys.exit(0)
 
@@ -503,20 +575,24 @@ def main():
         visual_log = get_visual_log(
             paths,
             args.video,
-            args.api_urls,
+            cluster_urls,
             threshold=args.phash_threshold,
             fps=1,
-            adaptive_spike=args.adaptive_spike  # <-- Pass the toggle
+            adaptive_spike=args.adaptive_spike
         )
 
     final_analysis = synthesize_timeline(
-        transcript, visual_log, args.api_urls[0])
+        transcript, visual_log, args.main_urls[0])
 
+    # Save to the internal cache as a backup
     with open(paths["final_analysis"], "w") as f:
         f.write(final_analysis)
 
+    # Save to the clean output directory
     prefix = "audio_only_" if args.audio_only else ""
-    human_readable_file = f"debug_summary_{prefix}{video_hash[:8]}.md"
+    human_readable_file = os.path.join(
+        output_dir, f"debug_summary_{prefix}{video_hash[:8]}.md")
+
     with open(human_readable_file, "w") as f:
         f.write(final_analysis)
 

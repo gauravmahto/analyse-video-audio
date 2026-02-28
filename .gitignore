@@ -22,4 +22,5 @@ extracted_frames/
 # Pipelines/cache
 .pipeline_cache/
 
-debug_summary*
+logs/
+output/

@@ -6,9 +6,11 @@ Analyze screen-recorded videos by combining audio transcription (Whisper) with v
 
 - **Perceptual Hashing (pHash)**: Deduplicates visually identical frames, reducing API calls by 60-80% on typical screen recordings.
 - **Content-Addressable Cache (CAS)**: Never re-process the same video twice; cache keys are based on file SHA-256 hashes.
-- **Distributed Parallel Inference**: Load-balance frame processing across multiple LLM server instances.
+- **Coordinator/Worker Cluster Inference**: Main servers handle synthesis while secondary servers process frame analysis.
 - **Anti-Hallucination Whisper Fixes**: Prevents the "Yeah Yeah Yeah" loops during silent sections.
 - **Long-form Timestamps**: Handles videos longer than 1 hour correctly.
+- **Live Terminal Dashboard**: Rich-based 2-column active processing UI for frame routing and completion.
+- **Organized Output Routing**: Saves summaries to `output/` and hashed logs to `logs/` automatically.
 
 ## What's here
 
@@ -41,6 +43,7 @@ Analyze screen-recorded videos by combining audio transcription (Whisper) with v
   - `requests`
   - `imagehash`
   - `Pillow`
+  - `rich`
   - `pandas` (for notebook)
   - `matplotlib` (for notebook)
   - `seaborn` (for notebook)
@@ -48,7 +51,7 @@ Analyze screen-recorded videos by combining audio transcription (Whisper) with v
 ## Install
 
 ```bash
-pip install -U openai-whisper requests imagehash Pillow pandas matplotlib seaborn
+pip install -U openai-whisper requests imagehash Pillow rich pandas matplotlib seaborn
 ```
 
 ### LLM server (llama.cpp)
@@ -100,10 +103,12 @@ python analyze_pipeline.py --video path/to/video.mp4
 python analyze_pipeline.py --video path/to/video.mp4 --audio-only
 ```
 
-### Distributed parallel inference
+### Coordinator/Worker cluster inference
 
 ```bash
-python analyze_pipeline.py --video path/to/video.mp4 --api-urls http://127.0.0.1:8033/v1/chat/completions http://127.0.0.1:8034/v1/chat/completions
+python analyze_pipeline.py --video path/to/video.mp4 \
+  --main-urls http://192.168.1.50:8033/v1/chat/completions \
+  --secondary-urls http://127.0.0.1:8033/v1/chat/completions
 ```
 
 ### Tune pHash threshold
@@ -112,6 +117,12 @@ Run a diagnostic to see frame distances:
 
 ```bash
 python analyze_pipeline.py --video path/to/video.mp4 --tune-phash
+```
+
+Tune more frames for better calibration:
+
+```bash
+python analyze_pipeline.py --video path/to/video.mp4 --tune-phash --tune-limit 100
 ```
 
 Then set your threshold:
@@ -222,8 +233,9 @@ FRAME_LIMIT = 100               # Limit to first N frames (0 = all)
 ### `analyze_pipeline.py`
 
 - `.pipeline_cache/<video_hash>/` — cached audio, frames, analysis
-- `pipeline_execution.log` — execution log
-- `debug_summary_<hash>.md` — final human-readable summary
+- `output/<video_basename>/debug_summary_<hash>.md` — final human-readable summary
+- `logs/pipeline_<video_basename>_<hash8>.log` — per-run log file
+- `logs/phash_tuning_report_<video_basename>_<hash8>.log` — tuning report (when using `--tune-phash`)
 
 ### `analyze_video_pipeline_full.py`
 
@@ -236,20 +248,21 @@ FRAME_LIMIT = 100               # Limit to first N frames (0 = all)
 
 - `ffmpeg` not found: confirm it's on PATH (`ffmpeg -version`). Reopen the terminal after install.
 - Whisper downloads are slow: ensure a stable network and try a smaller model (e.g., `base`).
-- LLM endpoint errors: verify the `--api-url` is reachable and the model name is `qwen3-vl`.
+- LLM endpoint errors: verify `--main-urls` / `--secondary-urls` are reachable and model is `qwen3-vl`.
 - Missing `imagehash` or `Pillow`: Install them with `pip install imagehash Pillow`.
+- Missing Rich UI: install with `pip install rich`.
 
 ## Which pipeline should I use?
 
-| Feature               | `analyze_pipeline.py`        | `analyze_video_pipeline_full.py`      |
-| --------------------- | ---------------------------- | ------------------------------------- |
-| Speed                 | ⚡ Fast (parallel)           | 🔧 Flexible                           |
-| Ease of use           | ✅ Recommended               | Advanced                              |
-| Frame filtering       | pHash                        | dHash                                 |
-| Tuning                | `--tune-phash`               | parameters                            |
-| Distributed inference | ✅ `--api-urls`              | Single server                         |
-| Caching               | Per-file                     | Per-step                              |
-| Best for              | UI/terminal recordings, cost | Production, research, reproducibility |
+| Feature         | `analyze_pipeline.py`                 | `analyze_video_pipeline_full.py`      |
+| --------------- | ------------------------------------- | ------------------------------------- |
+| Speed           | ⚡ Fast (parallel)                    | 🔧 Flexible                           |
+| Ease of use     | ✅ Recommended                        | Advanced                              |
+| Frame filtering | pHash                                 | dHash                                 |
+| Tuning          | `--tune-phash`                        | parameters                            |
+| Cluster mode    | ✅ `--main-urls` + `--secondary-urls` | Single server                         |
+| Caching         | Per-file                              | Per-step                              |
+| Best for        | UI/terminal recordings, cost          | Production, research, reproducibility |
 
 ## Notes
 
