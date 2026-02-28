@@ -6,28 +6,17 @@ This script processes screen recordings of terminal sessions and automatically g
 a debugging summary by combining an audio transcript with a visual terminal log.
 
 Key Features:
-- Content-Addressable Cache (CAS): Prevents re-processing identical videos.
-- Audio Hallucination Fix: Prevents Whisper from looping during silence.
+- Content-Addressable Cache (CAS): Prevents re-processing identical videos and parameters.
+- Global Frame CAS: Caches raw image bytes + exact prompt across all videos.
+- True Binary Frames: Images are stored by their SHA256 hash instead of chronological filenames.
+- Immutable Metadata: Outputs structured frame_selection.json and cluster_stats.json.
+- Stateful Time Tracking: Recovers execution time accurately even after force-quits (Ctrl+C).
+- Audio Hallucination Fix: Aggressive silence suppression for terminal recordings.
 - Intelligent pHash Deduplication: Uses Perceptual Hashing to drop identical video frames.
-- Coordinator/Worker Inference: Splits heavy text tasks and lightweight image tasks across machines.
-- pHash Tuner: Built-in diagnostic tool to calibrate frame filtering sensitivity.
-- Live Terminal UI: 2-column active processing dashboard.
-- Organized Outputs: Automatically routes summaries to /output and logs to /logs with dynamic hashing.
-
-==============================================================================
-CLI USAGE EXAMPLES
-==============================================================================
-1. Standard Analysis (Strict Deduplication - Best for UI, Jira, Webcams)
-   python analyze_pipeline.py --video bug_report.mp4
-
-2. Distributed Cluster Mode (Main handles text + images, Secondary handles ONLY images)
-   python analyze_pipeline.py --video bug_report.mp4 \
-     --main-urls http://192.168.1.50:8033/v1/chat/completions \
-     --secondary-urls http://127.0.0.1:8033/v1/chat/completions
-
-3. Adaptive Spike Mode (Best for fast-scrolling terminal logs)
-   python analyze_pipeline.py --video server_crash.mp4 --adaptive-spike
-==============================================================================
+- Coordinator/Worker Inference: True Dynamic Load Balancing across cluster machines.
+- Per-Server Slot Configurations: Dynamically allocate GPU slots per machine (e.g., URL:4).
+- Network Hardened: Automatic retries with exponential backoff and request timeouts.
+- Optional Live Terminal UI: 2-column active processing dashboard (graceful fallback if missing).
 """
 
 import os
@@ -44,22 +33,33 @@ import shutil
 import concurrent.futures
 import sys
 import threading
+import queue
+import json  # Added for manifest generation
 
 # --- Image Processing Imports ---
 from PIL import Image
 import imagehash
 
-# --- Live UI Imports ---
-from rich.live import Live
-from rich.table import Table
+# --- Optional Live UI Imports ---
+try:
+    from rich.live import Live
+    from rich.table import Table
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
 
-# --- Global Defaults ---
+# --- Global Defaults & Prompts ---
 VIDEO_PATH = "video1822201159.mp4"
 LLAMA_API_URL = "http://127.0.0.1:8033/v1/chat/completions"
 BASE_CACHE_DIR = ".pipeline_cache"
+GLOBAL_VLM_CACHE_DIR = os.path.join(BASE_CACHE_DIR, "global_vlm_cache")
+
+# Defined globally so it can be securely injected into the CAS hash key
+VISUAL_PROMPT = "Analyze this screen capture. What are the steps covered from start to end, and are there any errors or warnings visible?"
 
 # --- Setup Base Logging (Console Only Initially) ---
 os.makedirs("logs", exist_ok=True)
+os.makedirs(GLOBAL_VLM_CACHE_DIR, exist_ok=True)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -68,6 +68,18 @@ formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
+
+
+def parse_url_args(url_list, default_slots=1):
+    """Parses URLs and extracts custom slot counts if provided (e.g., url:4)."""
+    parsed = []
+    for item in url_list:
+        parts = item.rsplit(':', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            parsed.append((parts[0], int(parts[1])))
+        else:
+            parsed.append((item, default_slots))
+    return parsed
 
 
 def get_file_hash(filepath, chunk_size=8 * 1024 * 1024):
@@ -82,20 +94,92 @@ def get_file_hash(filepath, chunk_size=8 * 1024 * 1024):
         return None
 
 
-def setup_cache(video_hash, audio_type):
-    """Creates a unique hidden cache directory based on the file's hash."""
+def setup_cache(video_hash, audio_type, fps, threshold, adaptive_spike, model_name):
+    """Creates cache directories and dynamically names files based on run parameters."""
     cache_dir = os.path.join(BASE_CACHE_DIR, video_hash)
-    frames_dir = os.path.join(cache_dir, "frames")
+
+    frames_dir = os.path.join(cache_dir, f"frames_{fps}fps_cas")
     os.makedirs(frames_dir, exist_ok=True)
+
+    param_fingerprint = f"fps{fps}_t{threshold}_s{adaptive_spike}_{model_name}"
 
     return {
         "dir": cache_dir,
         "frames_dir": frames_dir,
         "audio": os.path.join(cache_dir, f"audio.{audio_type}"),
         "transcript": os.path.join(cache_dir, "transcript.txt"),
-        "visual_log": os.path.join(cache_dir, "visual_log.txt"),
-        "final_analysis": os.path.join(cache_dir, "final_analysis.md")
+        "visual_log": os.path.join(cache_dir, f"visual_log_{param_fingerprint}.txt"),
+        "final_analysis": os.path.join(cache_dir, f"final_analysis_{param_fingerprint}.md"),
+        "elapsed_time": os.path.join(cache_dir, f"elapsed_time_{param_fingerprint}.txt"),
+        "frame_manifest": os.path.join(cache_dir, f"frame_selection_{param_fingerprint}.json"),
+        "cluster_stats": os.path.join(cache_dir, f"cluster_stats_{param_fingerprint}.json")
     }
+
+
+def format_timestamp(seconds):
+    """Formats raw seconds into a readable MM:SS or HH:MM:SS string."""
+    seconds = int(seconds)
+    h, remainder = divmod(seconds, 3600)
+    m, s = divmod(remainder, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def format_duration(seconds):
+    """Formats overall elapsed time for the logs."""
+    h, remainder = divmod(int(seconds), 3600)
+    m, s = divmod(remainder, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    return f"{m:02d}m {s:02d}s"
+
+
+def robust_api_call(url, payload, max_retries=3):
+    """Network hardened API call with performance telemetry (Tokens/Second)."""
+    for attempt in range(max_retries):
+        try:
+            start_time = time.time()
+            response = requests.post(
+                url, headers={"Content-Type": "application/json"}, json=payload, timeout=180)
+
+            # If the server throws a 400 or 500 error, this triggers the exception
+            response.raise_for_status()
+
+            duration = time.time() - start_time
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+
+            usage = data.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+
+            tps = completion_tokens / duration if duration > 0 else 0
+
+            stats = {
+                "duration": duration,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "tps": tps
+            }
+
+            return content, stats
+
+        except requests.exceptions.RequestException as e:
+            # --- THE FIX: Extract the actual server rejection details ---
+            error_details = ""
+            if hasattr(e, 'response') and e.response is not None:
+                error_details = f" | Server Details: {e.response.text}"
+
+            if attempt == max_retries - 1:
+                logger.error(
+                    f"API Failed after {max_retries} attempts on {url}: {e}{error_details}")
+                # Raise a custom exception that includes the server details so synthesize_timeline catches it
+                raise Exception(f"{e}{error_details}")
+
+            logger.warning(
+                f"Network error on attempt {attempt+1}/{max_retries}. Retrying... ({e})")
+            time.sleep(2 ** attempt)
 
 
 def tune_phash_diagnostic(frames_dir, threshold, limit=50, output_file=None, adaptive_spike=False):
@@ -203,23 +287,21 @@ def get_transcript(paths, video_path):
     logger.info("Running Whisper model transcription...")
     model = whisper.load_model("base")
 
-    result = model.transcribe(paths["audio"], condition_on_previous_text=False)
-
-    def format_time(seconds):
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        if h > 0:
-            return f"{h:02d}:{m:02d}:{s:02d}"
-        return f"{m:02d}:{s:02d}"
+    # --- AGGRESSIVE SILENCE SUPPRESSION ENABLED ---
+    result = model.transcribe(
+        paths["audio"],
+        condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        logprob_threshold=-1.0
+    )
 
     transcript = ""
     for segment in result["segments"]:
         text = segment['text'].strip()
         if not text:
             continue
-        start = format_time(segment["start"])
-        end = format_time(segment["end"])
+        start = format_timestamp(segment["start"])
+        end = format_timestamp(segment["end"])
         transcript += f"[{start} - {end}] {text}\n"
 
     with open(paths["transcript"], "w") as f:
@@ -229,88 +311,169 @@ def get_transcript(paths, video_path):
     return transcript
 
 
-def get_visual_log(paths, video_path, cluster_urls, threshold=5, fps=1, adaptive_spike=False):
-    """Extracts frames, filters via pHash, and distributes to ALL cluster URLs in parallel."""
-    if os.path.exists(paths["visual_log"]) and os.path.getsize(paths["visual_log"]) > 0:
+def get_visual_log(paths, video_path, cluster_nodes, threshold=5, fps=1, adaptive_spike=False, model_name="qwen3-vl"):
+    """Extracts frames, hashes to true CAS, builds JSON manifest, and distributes via Queue."""
+
+    # Check for complete Cache + Manifest combo
+    if os.path.exists(paths["visual_log"]) and os.path.exists(paths["frame_manifest"]):
         logger.info(
-            "Visual log cache hit. Skipping FFmpeg and Qwen3-VL analysis.")
+            "Visual log and JSON Manifest cache hit. Skipping FFmpeg and Vision analysis.")
         with open(paths["visual_log"], "r") as f:
             return [line.strip() for line in f.readlines() if line.strip()]
 
     logger.info("Visual log cache miss. Initiating visual pipeline...")
-    logger.info(f"Extracting frames at {fps} fps to {paths['frames_dir']}...")
-    command = [
-        "ffmpeg", "-y", "-i", video_path,
-        "-vf", f"fps={fps}", f"{paths['frames_dir']}/frame_%04d.jpg"
-    ]
-    subprocess.run(command, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL)
 
-    frames = sorted(glob.glob(f"{paths['frames_dir']}/*.jpg"))
-    logger.info(
-        f"Extracted {len(frames)} raw frames. Analyzing perceptual hashes...")
+    # --- THE NEW BINARY CAS & JSON MANIFEST GENERATION ---
+    manifest_path = paths["frame_manifest"]
 
-    target_frames = []
-    SPIKE_DURATION = 3
-    MAX_STATIC_SECONDS = 30
-    last_hash = None
-    spike_counter = 0
-    frames_since_last_sent = 0
+    if not os.path.exists(manifest_path):
+        temp_dir = os.path.join(paths['frames_dir'], "temp_raw")
+        os.makedirs(temp_dir, exist_ok=True)
 
-    for frame_path in frames:
-        try:
-            with Image.open(frame_path) as img:
-                current_hash = imagehash.phash(img)
-        except Exception as e:
-            logger.error(
-                f"Failed to read image for hashing: {frame_path}. Error: {e}")
-            continue
+        logger.info(f"Extracting raw frames at {fps} fps to temp directory...")
+        command = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vf", f"fps={fps}", f"{temp_dir}/frame_%04d.jpg"
+        ]
+        subprocess.run(command, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
 
-        if last_hash is None:
-            target_frames.append(frame_path)
-            last_hash = current_hash
-            continue
+        temp_frames = sorted(glob.glob(os.path.join(temp_dir, "*.jpg")))
+        logger.info(
+            f"Loaded {len(temp_frames)} raw frames. Computing binary CAS and pHash...")
 
-        distance = current_hash - last_hash
+        manifest = []
+        last_hash = None
+        SPIKE_DURATION = 3
+        MAX_STATIC_SECONDS = 30
+        spike_counter = 0
+        frames_since_last_sent = 0
 
-        if distance > threshold:
-            target_frames.append(frame_path)
-            last_hash = current_hash
-            if adaptive_spike:
-                spike_counter = SPIKE_DURATION
-            frames_since_last_sent = 0
-        elif adaptive_spike and spike_counter > 0:
-            target_frames.append(frame_path)
-            last_hash = current_hash
-            spike_counter -= 1
-            frames_since_last_sent = 0
-        elif frames_since_last_sent >= MAX_STATIC_SECONDS:
-            target_frames.append(frame_path)
-            last_hash = current_hash
-            frames_since_last_sent = 0
-        else:
-            frames_since_last_sent += 1
+        for i, frame_path in enumerate(temp_frames, 1):
+            # 1. Compute exact raw binary hash
+            with open(frame_path, 'rb') as f:
+                img_bytes = f.read()
+            sha256_hash = hashlib.sha256(img_bytes).hexdigest()
+            cas_filename = f"{sha256_hash}.jpg"
+            cas_filepath = os.path.join(paths['frames_dir'], cas_filename)
 
-    total_targets = len(target_frames)
+            # 2. Convert to true CAS storage
+            if not os.path.exists(cas_filepath):
+                shutil.move(frame_path, cas_filepath)
+            else:
+                os.remove(frame_path)
+
+            time_sec = (i - 1) / fps
+            timestamp = format_timestamp(time_sec)
+            kept = False
+            action = ""
+
+            # 3. pHash Logic
+            try:
+                with Image.open(cas_filepath) as img:
+                    current_hash = imagehash.phash(img)
+            except Exception as e:
+                logger.error(
+                    f"Failed to read image for hashing: {cas_filepath}. Error: {e}")
+                continue
+
+            if last_hash is None:
+                kept = True
+                action = "First Frame"
+                last_hash = current_hash
+            else:
+                distance = current_hash - last_hash
+                if distance > threshold:
+                    kept = True
+                    action = "Change Spike"
+                    last_hash = current_hash
+                    if adaptive_spike:
+                        spike_counter = SPIKE_DURATION
+                    frames_since_last_sent = 0
+                elif adaptive_spike and spike_counter > 0:
+                    kept = True
+                    action = "Spike Falloff"
+                    last_hash = current_hash
+                    spike_counter -= 1
+                    frames_since_last_sent = 0
+                elif frames_since_last_sent >= MAX_STATIC_SECONDS:
+                    kept = True
+                    action = "Heartbeat"
+                    last_hash = current_hash
+                    frames_since_last_sent = 0
+                else:
+                    action = "Too Similar"
+                    frames_since_last_sent += 1
+
+            # 4. Append structured logic to manifest
+            manifest.append({
+                "index": i,
+                "time_sec": time_sec,
+                "timestamp": timestamp,
+                "sha256": sha256_hash,
+                "filename": cas_filename,
+                "kept": kept,
+                "reason": action
+            })
+
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=4)
+    else:
+        logger.info("JSON Manifest found. Loading existing frame metadata...")
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+
+    # Filter strictly by frames marked as "kept" in the JSON ledger
+    target_frames_meta = [m for m in manifest if m["kept"]]
+    total_targets = len(target_frames_meta)
+
     compression_ratio = round(
-        (1 - (total_targets / max(1, len(frames)))) * 100, 1)
+        (1 - (total_targets / max(1, len(manifest)))) * 100, 1)
     logger.info(
         f"pHash Dedupe complete. Dropped {compression_ratio}% of redundant frames.")
-    logger.info(
-        f"Distributing {total_targets} critical frames across {len(cluster_urls)} servers in cluster...")
 
-    # --- LIVE 2-COLUMN DASHBOARD SETUP ---
-    active_status = {url: "Idle" for url in cluster_urls}
+    # --- TRUE DYNAMIC LOAD BALANCER W/ CUSTOM SLOTS ---
+    url_pool = queue.Queue()
+    active_status = {}
+    total_slots = 0
+
+    for url, slots in cluster_nodes:
+        for i in range(slots):
+            slot_key = f"{url} (Slot {i+1})"
+            url_pool.put(f"{url}|{i+1}")
+            active_status[slot_key] = "Idle"
+            total_slots += 1
+
+    logger.info(
+        f"Dynamically distributing {total_targets} frames across {total_slots} global compute slots...")
+
+    # --- STATEFUL TIME & PROGRESS TRACKING INITIALIZATION ---
     completed_log = []
     status_lock = threading.Lock()
 
-    def generate_table():
-        """Generates the Rich UI Table dynamically"""
-        table = Table(show_header=True, header_style="bold cyan")
-        table.add_column("✅ Completed Frames", style="dim green", width=50)
-        table.add_column("⏳ Active Processing", style="yellow", width=50)
+    cluster_stats = {}
+    global_cache_hit_count = 0
+    global_completed_count = 0
 
-        num_rows = max(len(cluster_urls), 5)
+    previous_elapsed_time = 0.0
+    if os.path.exists(paths["elapsed_time"]):
+        try:
+            with open(paths["elapsed_time"], "r") as f:
+                previous_elapsed_time = float(f.read().strip())
+        except Exception:
+            previous_elapsed_time = 0.0
+
+    session_start_time = time.time()
+
+    def generate_table():
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("✅ Completed Frames", style="dim green", width=55)
+        table.add_column("⏳ Active Processing", style="yellow", width=55)
+
+        num_rows = total_slots
 
         with status_lock:
             recent_completed = completed_log[-num_rows:]
@@ -318,9 +481,7 @@ def get_visual_log(paths, video_path, cluster_urls, threshold=5, fps=1, adaptive
                 recent_completed.insert(0, "")
 
             active_list = [
-                f"[{url.split('//')[-1].split('/')[0]}] {task}" for url, task in active_status.items()]
-            while len(active_list) < num_rows:
-                active_list.append("")
+                f"[{slot_key.split('//')[-1]}] {task}" for slot_key, task in active_status.items()]
 
             for comp, act in zip(recent_completed, active_list):
                 table.add_row(comp, act)
@@ -328,26 +489,73 @@ def get_visual_log(paths, video_path, cluster_urls, threshold=5, fps=1, adaptive
         return table
 
     def process_frame(task_data):
-        index, frame_path, target_url = task_data
-        server_short = target_url.split('//')[-1].split('/')[0]
-        fname = os.path.basename(frame_path)
+        nonlocal global_cache_hit_count, global_completed_count
+        index, meta = task_data
 
-        with status_lock:
-            active_status[target_url] = f"{fname} ({index}/{total_targets})"
+        # Read true properties securely from the JSON Manifest
+        fname = meta["filename"]
+        sha256_hash = meta["sha256"]
+        timestamp = meta["timestamp"]
+        frame_path = os.path.join(paths['frames_dir'], fname)
 
         with open(frame_path, "rb") as image_file:
-            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+            img_bytes = image_file.read()
+            base64_image = base64.b64encode(img_bytes).decode('utf-8')
 
-        frame_num = int(fname.replace("frame_", "").replace(".jpg", ""))
-        timestamp = time.strftime('%M:%S', time.gmtime(frame_num))
+            # --- PROMPT INJECTION: Securing the cache key against prompt changes ---
+            cache_hasher = hashlib.sha256(img_bytes)
+            cache_hasher.update(model_name.encode('utf-8'))
+            cache_hasher.update(VISUAL_PROMPT.encode('utf-8'))
+            global_cache_key = cache_hasher.hexdigest()
+            global_cache_path = os.path.join(
+                GLOBAL_VLM_CACHE_DIR, f"{global_cache_key}.txt")
+
+        # -----------------------------------------
+        # SCENARIO 1: GLOBAL CACHE HIT
+        # -----------------------------------------
+        if os.path.exists(global_cache_path):
+            with open(global_cache_path, "r") as f:
+                analysis = f.read().strip()
+
+            with status_lock:
+                global_cache_hit_count += 1
+                global_completed_count += 1
+                current_total_time = previous_elapsed_time + \
+                    (time.time() - session_start_time)
+
+                with open(paths["elapsed_time"], "w") as f_time:
+                    f_time.write(str(current_total_time))
+
+                elapsed_str = format_duration(current_total_time)
+                # Keep UI clean by showing the short hash
+                completed_log.append(f"{sha256_hash[:8]} -> GLOBAL CACHE HIT")
+
+            logger.info(
+                f"♻️  [{global_completed_count:03d}/{total_targets:03d}] {sha256_hash[:8]}.jpg "
+                f"| GLOBAL CACHE HIT        "
+                f"| 100% API Compute Saved                      "
+                f"| Elapsed: {elapsed_str:>8}"
+            )
+            return f"[{timestamp}] Visual State: {analysis}"
+
+        # -----------------------------------------
+        # SCENARIO 2: LIVE NETWORK API CALL
+        # -----------------------------------------
+        assigned_slot = url_pool.get()
+        target_url, slot_num = assigned_slot.split("|")
+        slot_key = f"{target_url} (Slot {slot_num})"
+        server_short = target_url.split('//')[-1].split('/')[0]
+
+        with status_lock:
+            active_status[slot_key] = f"{sha256_hash[:8]} ({index}/{total_targets})"
 
         payload = {
-            "model": "qwen3-vl",
+            "model": model_name,
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Analyze this terminal output. What is the current build step, and are there any errors or warnings visible?"},
+                        {"type": "text", "text": VISUAL_PROMPT},
                         {"type": "image_url", "image_url": {
                             "url": f"data:image/jpeg;base64,{base64_image}"}}
                     ]
@@ -357,46 +565,109 @@ def get_visual_log(paths, video_path, cluster_urls, threshold=5, fps=1, adaptive
         }
 
         try:
-            response = requests.post(target_url, headers={
-                                     "Content-Type": "application/json"}, json=payload)
-            response.raise_for_status()
-            analysis = response.json()["choices"][0]["message"]["content"]
+            analysis, stats = robust_api_call(target_url, payload)
+
+            with open(global_cache_path, "w") as f:
+                f.write(analysis.strip())
 
             with status_lock:
-                active_status[target_url] = "Idle"
-                completed_log.append(f"{fname} -> {server_short} (Success)")
+                global_completed_count += 1
+
+                if server_short not in cluster_stats:
+                    cluster_stats[server_short] = {
+                        'frames': 0, 'tokens': 0, 'time': 0.0}
+                cluster_stats[server_short]['frames'] += 1
+                cluster_stats[server_short]['tokens'] += stats['completion_tokens']
+                cluster_stats[server_short]['time'] += stats['duration']
+
+                machine_total_frames = cluster_stats[server_short]['frames']
+                current_total_time = previous_elapsed_time + \
+                    (time.time() - session_start_time)
+
+                with open(paths["elapsed_time"], "w") as f_time:
+                    f_time.write(str(current_total_time))
+
+                elapsed_str = format_duration(current_total_time)
+                active_status[slot_key] = "Idle"
+                completed_log.append(
+                    f"{sha256_hash[:8]} -> {server_short} ({stats['tps']:.1f} t/s)")
+
+            logger.info(
+                f"✅ [{global_completed_count:03d}/{total_targets:03d}] {sha256_hash[:8]}.jpg "
+                f"| Node: {server_short:<18} "
+                f"| Node Total: {machine_total_frames:<3} "
+                f"| Speed: {stats['tps']:>4.1f} t/s "
+                f"| Time: {stats['duration']:>4.1f}s "
+                f"| Elapsed: {elapsed_str:>8}"
+            )
 
             return f"[{timestamp}] Visual State: {analysis.strip()}"
-        except Exception as e:
+
+        except Exception:
             with status_lock:
-                active_status[target_url] = "Idle"
-                completed_log.append(f"{fname} -> {server_short} (FAILED)")
+                active_status[slot_key] = "Idle"
+                completed_log.append(
+                    f"{sha256_hash[:8]} -> {server_short} (FAILED)")
             return f"[{timestamp}] Visual State: Error processing frame."
+        finally:
+            url_pool.put(assigned_slot)
 
-    tasks = []
-    for i, frame in enumerate(target_frames, 1):
-        target_url = cluster_urls[i % len(cluster_urls)]
-        tasks.append((i, frame, target_url))
-
+    # Pass the JSON dictionary items to the threaded worker instead of file paths
+    tasks = [(i, meta) for i, meta in enumerate(target_frames_meta, 1)]
     visual_log = []
-    max_concurrent = len(cluster_urls) * 2
+    max_concurrent = total_slots
 
-    # Disable standard logger temporarily so it doesn't break the Rich table
     if console_handler in logger.handlers:
         logger.removeHandler(console_handler)
 
     print("\n")
 
-    with Live(get_renderable=generate_table, refresh_per_second=10) as live:
+    if RICH_AVAILABLE:
+        with Live(get_renderable=generate_table, refresh_per_second=10):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+                results = executor.map(process_frame, tasks)
+                for res in results:
+                    visual_log.append(res)
+    else:
+        logger.info(
+            "Rich library not detected. Running standard parallel processing (No Live UI).")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
             results = executor.map(process_frame, tasks)
             for res in results:
                 visual_log.append(res)
+                logger.info(res)
 
     if console_handler not in logger.handlers:
         logger.addHandler(console_handler)
 
     logger.info("Distributed visual pipeline completed.")
+
+    if cluster_stats or global_cache_hit_count > 0:
+        logger.info("\n" + "="*70)
+        logger.info("📊 CLUSTER VISION PERFORMANCE SUMMARY")
+        logger.info("="*70)
+        for server, data in cluster_stats.items():
+            avg_tps = (data['tokens'] / data['time']
+                       ) if data['time'] > 0 else 0
+            logger.info(
+                f"🖥️  {server:<18} | Frames: {data['frames']:<4} | Tokens: {data['tokens']:<6} | Avg Speed: {avg_tps:.1f} t/s")
+        if global_cache_hit_count > 0:
+            logger.info(
+                f"♻️  Global Cache Hits  | Frames: {global_cache_hit_count:<4} | 100% API Compute Saved")
+
+        final_elapsed = previous_elapsed_time + \
+            (time.time() - session_start_time)
+        logger.info(
+            f"⏱️  Total Processing Time: {format_duration(final_elapsed)}")
+        logger.info("="*70 + "\n")
+
+        # --- JSON STATS LEDGER GENERATION ---
+        with open(paths["cluster_stats"], "w") as f:
+            json.dump({
+                "final_elapsed_seconds": final_elapsed,
+                "global_cache_hits": global_cache_hit_count,
+                "server_performance": cluster_stats
+            }, f, indent=4)
 
     with open(paths["visual_log"], "w") as f:
         for log in visual_log:
@@ -405,7 +676,7 @@ def get_visual_log(paths, video_path, cluster_urls, threshold=5, fps=1, adaptive
     return visual_log
 
 
-def synthesize_timeline(transcript, visual_log, synthesis_api_url):
+def synthesize_timeline(transcript, visual_log, synthesis_api_url, model_name="qwen3-vl"):
     """Synthesizes the audio transcript and visual logs into a final cohesive summary."""
     logger.info(
         f"Executing Synthesis Phase on Coordinator Server ({synthesis_api_url})...")
@@ -429,8 +700,8 @@ def synthesize_timeline(transcript, visual_log, synthesis_api_url):
     visual_text = "\n".join(compressed_log) if compressed_log else "None"
 
     master_prompt = f"""
-    You are an expert DevOps engineer and system debugger. 
-    I have provided two timelines extracted from a screen recording of a terminal session.
+    You are an expert engineer and system debugger. 
+    I have provided two timelines extracted from a screen recording of a technical session.
     
     1. AUDIO TRANSCRIPT:
     {transcript if transcript else "None"}
@@ -442,10 +713,11 @@ def synthesize_timeline(transcript, visual_log, synthesis_api_url):
     - Summarize the overall goal of the session.
     - Match spoken context with technical execution seen on screen.
     - Identify if there were any errors, warnings, or bottlenecks.
+    - Create a detailed steps covered from start to end which can be referred instead of watching the complete video.
     """
 
     payload = {
-        "model": "qwen3-vl",
+        "model": model_name,
         "messages": [{"role": "user", "content": [{"type": "text", "text": master_prompt}]}],
         "temperature": 0.3,
         "max_tokens": 2048
@@ -454,15 +726,14 @@ def synthesize_timeline(transcript, visual_log, synthesis_api_url):
     try:
         logger.info(
             "Sending compressed timelines to model for final synthesis. This may take a minute or two...")
-        response = requests.post(synthesis_api_url, headers={
-                                 "Content-Type": "application/json"}, json=payload)
-        response.raise_for_status()
-        logger.info("Synthesis complete.")
-        return response.json()["choices"][0]["message"]["content"]
-    except requests.exceptions.HTTPError as e:
-        error_details = e.response.text
-        logger.error(f"Server rejected the payload! Details: {error_details}")
-        return f"Synthesis Failed. Server said: {error_details}"
+
+        analysis, stats = robust_api_call(synthesis_api_url, payload)
+
+        logger.info(f"✅ Synthesis complete on {synthesis_api_url}")
+        logger.info(
+            f"📊 Synthesis Stats | Speed: {stats['tps']:.1f} t/s | Prompt: {stats['prompt_tokens']} tkns | Gen: {stats['completion_tokens']} tkns | Time: {stats['duration']:.1f}s")
+
+        return analysis
     except Exception as e:
         logger.error(f"Unexpected error during final synthesis: {e}")
         return f"Error during final synthesis: {e}"
@@ -474,11 +745,13 @@ def main():
     parser.add_argument("--video", type=str, default=VIDEO_PATH,
                         help="Path to the video or audio file")
 
-    # --- CLUSTER ARGUMENTS ---
     parser.add_argument("--main-urls", type=str, nargs='+', default=[LLAMA_API_URL],
-                        help="Primary LLM servers. The FIRST one will be used for the final heavy text synthesis.")
+                        help="Primary LLM servers. The FIRST one handles final heavy text synthesis. Optional slot count: e.g. URL:4")
     parser.add_argument("--secondary-urls", type=str, nargs='*', default=[],
-                        help="Worker LLM servers used ONLY for parallel image processing.")
+                        help="Worker LLM servers used ONLY for parallel image processing. Optional slot count: e.g. URL:2")
+
+    parser.add_argument("--model", type=str, default="qwen3-vl",
+                        help="The model name expected by the API endpoint (default: qwen3-vl)")
 
     parser.add_argument("--audio-only", action="store_true",
                         help="Only process audio, skipping visual pipeline")
@@ -487,7 +760,6 @@ def main():
     parser.add_argument("--clear-cache", action="store_true",
                         help="Delete existing cache for this file and run fresh")
 
-    # --- pHash Tuning Arguments ---
     parser.add_argument("--phash-threshold", type=int, default=5,
                         help="The perceptual hash distance required to trigger a frame capture (default: 5)")
     parser.add_argument("--tune-phash", action="store_true",
@@ -498,41 +770,45 @@ def main():
                         help="Enable spike memory to capture sequential frames after a change (Best for scrolling terminals)")
 
     args = parser.parse_args()
-    cluster_urls = args.main_urls + args.secondary_urls
 
-    # 1. Determine paths and basenames
+    main_parsed = parse_url_args(args.main_urls, default_slots=1)
+    secondary_parsed = parse_url_args(args.secondary_urls, default_slots=1)
+    cluster_nodes = main_parsed + secondary_parsed
+
+    total_slots = sum(slots for url, slots in cluster_nodes)
+    synthesis_url = main_parsed[0][0]  # Pure URL, stripped of :slots
+
+    FPS = 1
+
     video_basename = os.path.splitext(os.path.basename(args.video))[0]
     input_ext = os.path.splitext(args.video)[1].lower().strip('.')
     if not input_ext:
         input_ext = "m4a"
     target_audio_type = args.audio_type if args.audio_type else input_ext
 
-    # 2. Calculate the Hash silently
     video_hash = get_file_hash(args.video)
     if not video_hash:
         logger.error(f"❌ File not found: {args.video}")
         sys.exit(1)
 
-    # 3. Add dynamic FileHandler now that we have the hash
     log_filename = os.path.join(
         "logs", f"pipeline_{video_basename}_{video_hash[:8]}.log")
     file_handler = logging.FileHandler(log_filename)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # 4. Now begin emitting logs (they will go to console AND the new dynamic file)
     logger.info("=== Starting Multimodal Pipeline Execution ===")
     logger.info(f"Target Media: {args.video}")
     logger.info(f"Media signature (Hash): {video_hash}")
+    logger.info(f"Target LLM Model: {args.model}")
 
     if not args.tune_phash:
         logger.info(
-            f"Cluster Size: {len(cluster_urls)} total instances ({len(args.main_urls)} Main, {len(args.secondary_urls)} Secondary)")
-        logger.info(f"Synthesis Coordinator: {args.main_urls[0]}")
+            f"Cluster Size: {len(cluster_nodes)} total instances ({total_slots} global compute slots)")
+        logger.info(f"Synthesis Coordinator: {synthesis_url}")
     if args.audio_only:
         logger.info("MODE: AUDIO-ONLY")
 
-    # Setup the structured output directory for this specific video
     output_dir = os.path.join("output", video_basename)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -544,7 +820,8 @@ def main():
         else:
             logger.info("No existing cache found to clear.")
 
-    paths = setup_cache(video_hash, target_audio_type)
+    paths = setup_cache(video_hash, target_audio_type, FPS,
+                        args.phash_threshold, args.adaptive_spike, args.model)
 
     if args.tune_phash:
         logger.info("MODE: pHash Tuning Diagnostic")
@@ -552,11 +829,10 @@ def main():
         if not glob.glob(os.path.join(paths['frames_dir'], "*.jpg")):
             logger.info("Extracting frames for diagnostic run...")
             command = ["ffmpeg", "-y", "-i", args.video, "-vf",
-                       "fps=1", f"{paths['frames_dir']}/frame_%04d.jpg"]
+                       f"fps={FPS}", f"{paths['frames_dir']}/frame_%04d.jpg"]
             subprocess.run(command, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL)
 
-        # Route tuning log securely to the /logs folder
         tuning_report_file = os.path.join(
             "logs", f"phash_tuning_report_{video_basename}_{video_hash[:8]}.log")
         tune_phash_diagnostic(
@@ -575,23 +851,23 @@ def main():
         visual_log = get_visual_log(
             paths,
             args.video,
-            cluster_urls,
+            cluster_nodes,
             threshold=args.phash_threshold,
-            fps=1,
-            adaptive_spike=args.adaptive_spike
+            fps=FPS,
+            adaptive_spike=args.adaptive_spike,
+            model_name=args.model
         )
 
     final_analysis = synthesize_timeline(
-        transcript, visual_log, args.main_urls[0])
+        transcript, visual_log, synthesis_url, model_name=args.model)
 
-    # Save to the internal cache as a backup
     with open(paths["final_analysis"], "w") as f:
         f.write(final_analysis)
 
-    # Save to the clean output directory
     prefix = "audio_only_" if args.audio_only else ""
+    param_fingerprint = f"fps{FPS}_t{args.phash_threshold}_s{args.adaptive_spike}_{args.model}"
     human_readable_file = os.path.join(
-        output_dir, f"debug_summary_{prefix}{video_hash[:8]}.md")
+        output_dir, f"debug_summary_{prefix}{video_hash[:8]}_{param_fingerprint}.md")
 
     with open(human_readable_file, "w") as f:
         f.write(final_analysis)

@@ -4,13 +4,17 @@ Analyze screen-recorded videos by combining audio transcription (Whisper) with v
 
 **Key Features:**
 
-- **Perceptual Hashing (pHash)**: Deduplicates visually identical frames, reducing API calls by 60-80% on typical screen recordings.
-- **Content-Addressable Cache (CAS)**: Never re-process the same video twice; cache keys are based on file SHA-256 hashes.
-- **Coordinator/Worker Cluster Inference**: Main servers handle synthesis while secondary servers process frame analysis.
+- **Perceptual Hashing (pHash/dHash)**: Deduplicates visually identical frames, reducing API calls by 60-80% on typical screen recordings.
+- **Global Frame CAS**: Cross-video caching prevents re-processing identical frames across different videos.
+- **Content-Addressable Cache**: Never re-process the same video twice; cache keys are based on file SHA-256 hashes.
+- **Coordinator/Worker Cluster Inference**: Main servers handle synthesis while secondary servers process frame analysis with per-server slot configurations.
+- **JSON Manifests & Metadata**: Comprehensive tracking of frame selection, cluster performance, and run parameters.
+- **Stateful Time Tracking**: Accurately recovers elapsed time even after force-quits or restarts.
+- **Network Hardened**: Automatic retries with exponential backoff and request timeouts for reliable distributed inference.
 - **Anti-Hallucination Whisper Fixes**: Prevents the "Yeah Yeah Yeah" loops during silent sections.
 - **Long-form Timestamps**: Handles videos longer than 1 hour correctly.
 - **Live Terminal Dashboard**: Rich-based 2-column active processing UI for frame routing and completion.
-- **Organized Output Routing**: Saves summaries to `output/` and hashed logs to `logs/` automatically.
+- **Organized Output Routing**: Saves summaries to `output/` with comprehensive metadata and logs to `logs/` automatically.
 
 ## What's here
 
@@ -18,15 +22,21 @@ Analyze screen-recorded videos by combining audio transcription (Whisper) with v
 
 - **`analyze_pipeline.py`** (Recommended for most users)
   - Fast parallel frame analysis with perceptual hashing (pHash)
-  - Distributed inference across multiple LLM servers
+  - Global Frame CAS: cross-video caching of frame analyses
+  - JSON manifests for frame selection and cluster performance tracking
+  - Distributed inference across multiple LLM servers with per-server slot configurations
+  - Stateful elapsed time tracking (survives restarts)
   - Real-time diagnostic tuning with `--tune-phash`
   - Best for: quick iteration, UI recordings, cost optimization
 
 - **`analyze_video_pipeline_full.py`** (For advanced/backend use)
-  - Fully documented, deterministic pipeline with adaptive dHash frame selection
-  - Per-step idempotent caching with binary content fingerprints
-  - Comprehensive logging and frame selection tracking
-  - Best for: production workflows, reproducibility, parameter research
+  - Fully documented, deterministic pipeline with hash-mode switching (pHash/dHash)
+  - Per-step idempotent caching with Content-Addressable Storage (CAS) layout
+  - Global Frame CAS: cross-video frame caching with prompt versioning
+  - Comprehensive JSON metadata: run parameters, cluster stats, frame selection traces
+  - Structured output organization with run metadata and artifact tracking
+  - Network hardened with exponential backoff and configurable timeouts
+  - Best for: production workflows, reproducibility, parameter research, multi-video analysis
 
 - **`phash_visualizer.ipynb`** (Jupyter notebook for analysis & tuning)
   - Interactive visualization of perceptual hash distances
@@ -103,13 +113,15 @@ python analyze_pipeline.py --video path/to/video.mp4
 python analyze_pipeline.py --video path/to/video.mp4 --audio-only
 ```
 
-### Coordinator/Worker cluster inference
+### Coordinator/Worker cluster inference with per-server slots
 
 ```bash
 python analyze_pipeline.py --video path/to/video.mp4 \
-  --main-urls http://192.168.1.50:8033/v1/chat/completions \
-  --secondary-urls http://127.0.0.1:8033/v1/chat/completions
+  --main-urls http://192.168.1.50:8033/v1/chat/completions:2 \
+  --secondary-urls http://192.168.1.51:8033/v1/chat/completions:4 http://192.168.1.52:8033/v1/chat/completions:4
 ```
+
+**Slot configuration**: Append `:N` to any URL to allocate N parallel slots (e.g., `URL:4` = 4 parallel workers on that server).
 
 ### Tune pHash threshold
 
@@ -156,31 +168,50 @@ Fully documented, idempotent backend pipeline with comprehensive parameter contr
 ### Basic run
 
 ```bash
-python analyze_video_pipeline_full.py
+python analyze_video_pipeline_full.py --do-vlm
 ```
 
-### With VLM analysis
+### Hash mode selection (pHash vs dHash)
 
 ```bash
-python analyze_video_pipeline_full.py --do_vlm
+# Use pHash (better for compressed videos, default)
+python analyze_video_pipeline_full.py --do-vlm --hash-mode phash --threshold 5
+
+# Use dHash (faster, good for UI recordings)
+python analyze_video_pipeline_full.py --do-vlm --hash-mode dhash --threshold 6
 ```
 
-### Custom tuning
+### Cluster inference with per-server slots
 
 ```bash
-python analyze_video_pipeline_full.py \
+python analyze_video_pipeline_full.py --do-vlm \
+  --main-urls http://192.168.1.50:8033/v1/chat/completions:2 \
+  --secondary-urls http://192.168.1.51:8033/v1/chat/completions:4
+```
+
+### Custom tuning with adaptive spike
+
+```bash
+python analyze_video_pipeline_full.py --do-vlm \
   --fps 1 \
-  --change_threshold 6 \
-  --burst_window 3 \
-  --whisper_model small \
-  --do_vlm
+  --hash-mode phash \
+  --threshold 5 \
+  --adaptive-spike \
+  --burst-window 3 \
+  --heartbeat-seconds 30 \
+  --whisper-model small
 ```
 
-**dHash threshold tuning:**
+### Hash tuning diagnostic
 
-- `--change_threshold 4`: More sensitive, more frames
-- `--change_threshold 6`: Default, balanced
-- `--change_threshold 8+`: Less sensitive, fewer API calls
+```bash
+python analyze_video_pipeline_full.py --tune-hash --hash-mode phash --threshold 5 --tune-limit 100
+```
+
+**Threshold tuning:**
+
+- **pHash**: `--threshold 3-4` (sensitive), `5` (balanced), `6-8` (conservative)
+- **dHash**: `--threshold 4-5` (sensitive), `6` (balanced), `8+` (conservative)
 
 ---
 
@@ -233,16 +264,32 @@ FRAME_LIMIT = 100               # Limit to first N frames (0 = all)
 ### `analyze_pipeline.py`
 
 - `.pipeline_cache/<video_hash>/` — cached audio, frames, analysis
-- `output/<video_basename>/debug_summary_<hash>.md` — final human-readable summary
+  - `frames_<fps>fps_cas/` — Binary content-addressable frame storage (SHA256-named)
+  - `frame_selection_<params>.json` — JSON manifest of all frames with selection metadata
+  - `cluster_stats_<params>.json` — JSON summary of cluster performance and cache hits
+  - `elapsed_time_<params>.txt` — Stateful elapsed time (persists across restarts)
+  - `.pipeline_cache/global_vlm_cache/` — Global cross-video frame analysis cache
+- `output/<video_basename>/debug_summary_<hash>_<params>.md` — final human-readable summary
 - `logs/pipeline_<video_basename>_<hash8>.log` — per-run log file
 - `logs/phash_tuning_report_<video_basename>_<hash8>.log` — tuning report (when using `--tune-phash`)
 
 ### `analyze_video_pipeline_full.py`
 
-- `.pipeline_cache/` — binary content-based cache
-- `.pipeline_runs/<timestamp>/` — per-run logs
-- `frame_selection.json` — adaptive frame selection report
-- `frames_analysis.jsonl` — frame-by-frame VLM results
+- `.pipeline_cache/` — Content-Addressable Storage (CAS) with step-based organization
+  - `audio_extract/` — Idempotent audio extraction cache
+  - `whisper/` — Idempotent transcription cache with JSON metadata
+  - `frames_select/` — Idempotent frame selection cache with SHA256-named frames
+  - `elapsed_time/` — Stateful elapsed time tracking per parameter set
+  - `global_vlm_cache/` — Global cross-video frame analysis cache
+- `output/<video_basename>/` — Organized output directory per video
+  - `debug_summary_<hash>_<params>.md` — Final synthesis summary
+  - `frame_selection.json` — Complete frame selection trace with timestamps and distances
+  - `visual_log.txt` — Timestamped visual state changes
+  - `cluster_perf_summary.json` — Per-server performance stats and global cache hits
+  - `run_metadata.json` — Comprehensive run parameters, cluster config, and output paths
+  - `transcript-analyze_pipeline.txt` — Timestamped audio transcript
+  - `transcript-analyze_pipeline.txt.json` — Raw Whisper output with segment details
+- `logs/pipeline_<video_basename>_<hash8>_<timestamp>.log` — Detailed per-run log with DEBUG level
 
 ## Troubleshooting
 
@@ -254,24 +301,34 @@ FRAME_LIMIT = 100               # Limit to first N frames (0 = all)
 
 ## Which pipeline should I use?
 
-| Feature         | `analyze_pipeline.py`                 | `analyze_video_pipeline_full.py`      |
-| --------------- | ------------------------------------- | ------------------------------------- |
-| Speed           | ⚡ Fast (parallel)                    | 🔧 Flexible                           |
-| Ease of use     | ✅ Recommended                        | Advanced                              |
-| Frame filtering | pHash                                 | dHash                                 |
-| Tuning          | `--tune-phash`                        | parameters                            |
-| Cluster mode    | ✅ `--main-urls` + `--secondary-urls` | Single server                         |
-| Caching         | Per-file                              | Per-step                              |
-| Best for        | UI/terminal recordings, cost          | Production, research, reproducibility |
+| Feature             | `analyze_pipeline.py`                 | `analyze_video_pipeline_full.py`               |
+| ------------------- | ------------------------------------- | ---------------------------------------------- |
+| Speed               | ⚡ Fast (parallel)                    | 🔧 Flexible                                    |
+| Ease of use         | ✅ Recommended                        | Advanced                                       |
+| Frame filtering     | pHash                                 | pHash or dHash (switchable)                    |
+| Hash mode switching | No                                    | ✅ `--hash-mode phash/dhash`                   |
+| Tuning              | `--tune-phash`                        | `--tune-hash`                                  |
+| Cluster mode        | ✅ `--main-urls` + `--secondary-urls` | ✅ `--main-urls` + `--secondary-urls`          |
+| Per-server slots    | ✅ `URL:N` syntax                     | ✅ `URL:N` syntax                              |
+| Caching             | Per-file + Global Frame CAS           | Per-step CAS + Global Frame CAS                |
+| JSON metadata       | ✅ Manifests + cluster stats          | ✅ Full run metadata + performance tracking    |
+| Stateful time track | ✅ Survives restarts                  | ✅ Survives restarts                           |
+| Network hardening   | ✅ Exponential backoff                | ✅ Configurable timeouts + backoff             |
+| Output organization | `output/` + `logs/`                   | `output/<video>/` with comprehensive artifacts |
+| Best for            | UI/terminal recordings, quick runs    | Production, multi-video, research              |
 
 ## Notes
 
 - Both pipelines expect `qwen3-vl` model when using VLM.
-- Content-based caching: videos identified by SHA-256 hash, not filename.
-- pHash (`analyze_pipeline.py`) can reduce API calls by 60-80%.
-- dHash (`analyze_video_pipeline_full.py`) provides detailed frame selection logs.
-- **Adaptive Spike Mode**: Enables burst frame capture after changes, best for terminal logs and scrolling content
+- **Content-based caching**: Videos identified by SHA-256 hash, not filename. Prevents re-processing renamed files.
+- **Global Frame CAS**: Both pipelines cache frame analyses across videos, preventing redundant API calls for identical frames.
+- **pHash vs dHash**:
+  - pHash: More robust under compression, recommended for screen recordings (both pipelines)
+  - dHash: Faster computation, good for UI recordings (`analyze_video_pipeline_full.py` only)
+- **Perceptual hashing** can reduce API calls by 60-80% on typical screen recordings.
+- **JSON metadata**: Both pipelines now output comprehensive tracking data for frame selection, cluster performance, and run parameters.
+- **Adaptive Spike Mode**: Enables burst frame capture after changes, best for terminal logs and scrolling content.
 - **Threshold recommendations**:
-  - Silent/mostly static videos: `--phash-threshold 6-8` (fewer API calls)
-  - UI/terminal with moderate activity: `--phash-threshold 5` (default, balanced)
-  - Fast scrolling/coding sessions: `--phash-threshold 3-4` with `--adaptive-spike` (more frames)
+  - Silent/mostly static videos: `--threshold 6-8` (fewer API calls)
+  - UI/terminal with moderate activity: `--threshold 5` (default, balanced)
+  - Fast scrolling/coding sessions: `--threshold 3-4` with `--adaptive-spike` (more frames)
