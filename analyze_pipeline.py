@@ -6,18 +6,38 @@ This script processes screen recordings of terminal sessions and automatically g
 a debugging summary by combining an audio transcript with a visual terminal log.
 
 Key Features:
-- Content-Addressable Cache (CAS): Prevents re-processing identical videos and parameters.
-- Global Frame CAS: Caches raw image bytes + exact prompt across all videos.
-- True Binary Frames: Images are stored by their SHA256 hash instead of chronological filenames.
-- Immutable Metadata: Outputs structured frame_selection.json and cluster_stats.json.
-- Stateful Time Tracking: Recovers execution time accurately even after force-quits (Ctrl+C).
+- Split-Model Architecture: Route image tasks to a fast Vision Language Model (VLM) 
+  and route final reasoning to a heavy Text LLM on a separate server/port.
+- True Binary Frames (CAS): Images are hashed and stored by their SHA256 bytes 
+  instead of chronological filenames for bulletproof caching.
+- Immutable Metadata: Outputs structured `frame_selection.json` and `cluster_stats.json`.
+- Fuzzy Text Compression: Uses sliding-window text similarity to drop repetitive 
+  scrolling terminal logs, protecting the final context window.
+- Stateful Time Tracking: Recovers execution time perfectly even after force-quits (Ctrl+C).
 - Audio Hallucination Fix: Aggressive silence suppression for terminal recordings.
-- Intelligent pHash Deduplication: Uses Perceptual Hashing to drop identical video frames.
-- Fuzzy Text Compression: Slides a similarity window over VLM outputs to drop repetitive states.
+- Intelligent pHash Deduplication: Uses Perceptual Hashing to drop static video frames.
 - Coordinator/Worker Inference: True Dynamic Load Balancing across cluster machines.
-- Per-Server Slot Configurations: Dynamically allocate GPU slots per machine (e.g., URL:4).
-- Network Hardened: Automatic retries with exponential backoff and request timeouts.
-- Optional Live Terminal UI: 2-column active processing dashboard (graceful fallback if missing).
+
+==============================================================================
+CLI USAGE EXAMPLES
+==============================================================================
+1. Standard Analysis (Single Server)
+   python analyze_pipeline.py --video bug_report.mp4
+
+2. Distributed Vision Cluster (Split image processing across machines)
+   python analyze_pipeline.py --video bug_report.mp4 \
+     --main-urls http://127.0.0.1:8033/v1/chat/completions:4 \
+     --secondary-urls http://192.168.1.97:8033/v1/chat/completions:2
+
+3. Split-Model Architecture (Fast VLM for images, Heavy LLM for final text)
+   # Run qwen3-vl on Port 8033 for images. Run hermes-2-pro on Port 8034 for text.
+   python analyze_pipeline.py --video bug_report.mp4 \
+     --model qwen3-vl \
+     --main-urls http://127.0.0.1:8033/v1/chat/completions:4 \
+     --synthesis-model hermes-2-pro \
+     --synthesis-url http://127.0.0.1:8034/v1/chat/completions \
+     --synthesis-timeout 3600
+==============================================================================
 """
 
 import os
@@ -35,8 +55,8 @@ import concurrent.futures
 import sys
 import threading
 import queue
-import json  # Added for manifest generation
-import difflib  # Added for Fuzzy Text Compression
+import json
+import difflib
 
 # --- Image Processing Imports ---
 from PIL import Image
@@ -57,9 +77,9 @@ BASE_CACHE_DIR = ".pipeline_cache"
 GLOBAL_VLM_CACHE_DIR = os.path.join(BASE_CACHE_DIR, "global_vlm_cache")
 
 # Defined globally so it can be securely injected into the CAS hash key
-VISUAL_PROMPT = "Analyze this screen capture. What are the steps covered from start to end, and are there any errors or warnings visible?"
+VISUAL_PROMPT = "Describe the active terminal command, code being edited, or UI navigation happening in this exact frame. Use a maximum of 25 words. Be extremely concise. Do not use conversational filler like 'The screen shows' or 'Based on the image'."
 
-# --- Setup Base Logging (Console Only Initially) ---
+# --- Setup Base Logging ---
 os.makedirs("logs", exist_ok=True)
 os.makedirs(GLOBAL_VLM_CACHE_DIR, exist_ok=True)
 
@@ -96,14 +116,18 @@ def get_file_hash(filepath, chunk_size=8 * 1024 * 1024):
         return None
 
 
-def setup_cache(video_hash, audio_type, fps, threshold, adaptive_spike, model_name):
+def setup_cache(video_hash, audio_type, fps, threshold, adaptive_spike, model_name, synthesis_model_name):
     """Creates cache directories and dynamically names files based on run parameters."""
     cache_dir = os.path.join(BASE_CACHE_DIR, video_hash)
 
     frames_dir = os.path.join(cache_dir, f"frames_{fps}fps_cas")
     os.makedirs(frames_dir, exist_ok=True)
 
-    param_fingerprint = f"fps{fps}_t{threshold}_s{adaptive_spike}_{model_name}"
+    # --- THE FIX: Create a tiny 6-character hash of the current VISUAL_PROMPT ---
+    prompt_hash = hashlib.md5(VISUAL_PROMPT.encode('utf-8')).hexdigest()[:6]
+
+    # Include the prompt hash in the fingerprint!
+    param_fingerprint = f"fps{fps}_t{threshold}_s{adaptive_spike}_{model_name}_{synthesis_model_name}_p{prompt_hash}"
 
     return {
         "dir": cache_dir,
@@ -168,7 +192,7 @@ def robust_api_call(url, payload, max_retries=3, timeout=180):
             return content, stats
 
         except requests.exceptions.RequestException as e:
-            # --- THE FIX: Extract the actual server rejection details ---
+            # Extract the actual server rejection details (e.g., Context window exceeded)
             error_details = ""
             if hasattr(e, 'response') and e.response is not None:
                 error_details = f" | Server Details: {e.response.text}"
@@ -176,7 +200,7 @@ def robust_api_call(url, payload, max_retries=3, timeout=180):
             if attempt == max_retries - 1:
                 logger.error(
                     f"API Failed after {max_retries} attempts on {url}: {e}{error_details}")
-                # Raise a custom exception that includes the server details so synthesize_timeline catches it
+                # Raise custom exception with server details to be caught later
                 raise Exception(f"{e}{error_details}")
 
             logger.warning(
@@ -290,11 +314,13 @@ def get_transcript(paths, video_path):
     model = whisper.load_model("base")
 
     # --- AGGRESSIVE SILENCE SUPPRESSION ENABLED ---
+    # fp16=False prevents warnings on CPU execution environments (e.g., Apple Silicon M-series)
     result = model.transcribe(
         paths["audio"],
         condition_on_previous_text=False,
         no_speech_threshold=0.6,
-        logprob_threshold=-1.0
+        logprob_threshold=-1.0,
+        fp16=False
     )
 
     transcript = ""
@@ -681,7 +707,7 @@ def get_visual_log(paths, video_path, cluster_nodes, threshold=5, fps=1, adaptiv
 def synthesize_timeline(transcript, visual_log, synthesis_api_url, model_name="qwen3-vl", timeout=1800):
     """Synthesizes the audio transcript and visual logs into a final cohesive summary."""
     logger.info(
-        f"Executing Synthesis Phase on Coordinator Server ({synthesis_api_url})...")
+        f"Executing Synthesis Phase on Coordinator Server ({synthesis_api_url}) with model: {model_name}...")
 
     compressed_log = []
     last_state = ""
@@ -729,7 +755,7 @@ def synthesize_timeline(transcript, visual_log, synthesis_api_url, model_name="q
         "model": model_name,
         "messages": [{"role": "user", "content": [{"type": "text", "text": master_prompt}]}],
         "temperature": 0.3,
-        "max_tokens": 2048
+        "max_tokens": 16384
     }
 
     try:
@@ -757,12 +783,18 @@ def main():
                         help="Path to the video or audio file")
 
     parser.add_argument("--main-urls", type=str, nargs='+', default=[LLAMA_API_URL],
-                        help="Primary LLM servers. The FIRST one handles final heavy text synthesis. Optional slot count: e.g. URL:4")
+                        help="Primary LLM servers. Optional slot count: e.g. URL:4")
     parser.add_argument("--secondary-urls", type=str, nargs='*', default=[],
                         help="Worker LLM servers used ONLY for parallel image processing. Optional slot count: e.g. URL:2")
 
     parser.add_argument("--model", type=str, default="qwen3-vl",
-                        help="The model name expected by the API endpoint (default: qwen3-vl)")
+                        help="The model name expected by the API endpoint for image processing (default: qwen3-vl)")
+
+    # --- NEW: DISTINCT SYNTHESIS MODEL & URL ROUTING ---
+    parser.add_argument("--synthesis-model", type=str,
+                        help="The model name to use for the final text synthesis. If not provided, defaults to the image --model.")
+    parser.add_argument("--synthesis-url", type=str,
+                        help="A dedicated LLM server endpoint for the final text synthesis (e.g. port 8034). Defaults to the first main-url.")
 
     # --- NEW: CONFIGURABLE TIMEOUT ---
     parser.add_argument("--synthesis-timeout", type=int, default=1800,
@@ -786,12 +818,17 @@ def main():
 
     args = parser.parse_args()
 
+    # Determine synthesis model logic early
+    target_synthesis_model = args.synthesis_model if args.synthesis_model else args.model
+
     main_parsed = parse_url_args(args.main_urls, default_slots=1)
     secondary_parsed = parse_url_args(args.secondary_urls, default_slots=1)
     cluster_nodes = main_parsed + secondary_parsed
 
     total_slots = sum(slots for url, slots in cluster_nodes)
-    synthesis_url = main_parsed[0][0]  # Pure URL, stripped of :slots
+
+    # Dynamically route the final synthesis call to the provided URL, or fallback to main
+    synthesis_url = args.synthesis_url if args.synthesis_url else main_parsed[0][0]
 
     FPS = 1
 
@@ -815,7 +852,8 @@ def main():
     logger.info("=== Starting Multimodal Pipeline Execution ===")
     logger.info(f"Target Media: {args.video}")
     logger.info(f"Media signature (Hash): {video_hash}")
-    logger.info(f"Target LLM Model: {args.model}")
+    logger.info(f"Vision Model: {args.model}")
+    logger.info(f"Synthesis Model: {target_synthesis_model}")
 
     if not args.tune_phash:
         logger.info(
@@ -835,8 +873,9 @@ def main():
         else:
             logger.info("No existing cache found to clear.")
 
+    # Passed the synthesis model into cache setup to make the output filename perfectly unique
     paths = setup_cache(video_hash, target_audio_type, FPS,
-                        args.phash_threshold, args.adaptive_spike, args.model)
+                        args.phash_threshold, args.adaptive_spike, args.model, target_synthesis_model)
 
     if args.tune_phash:
         logger.info("MODE: pHash Tuning Diagnostic")
@@ -873,15 +912,15 @@ def main():
             model_name=args.model
         )
 
-    # --- DYNAMIC TIMEOUT INJECTION ---
+    # Route the final execution exactly to the URL and Model requested
     final_analysis = synthesize_timeline(
-        transcript, visual_log, synthesis_url, model_name=args.model, timeout=args.synthesis_timeout)
+        transcript, visual_log, synthesis_url, model_name=target_synthesis_model, timeout=args.synthesis_timeout)
 
     with open(paths["final_analysis"], "w") as f:
         f.write(final_analysis)
 
     prefix = "audio_only_" if args.audio_only else ""
-    param_fingerprint = f"fps{FPS}_t{args.phash_threshold}_s{args.adaptive_spike}_{args.model}"
+    param_fingerprint = f"fps{FPS}_t{args.phash_threshold}_s{args.adaptive_spike}_{args.model}_{target_synthesis_model}"
     human_readable_file = os.path.join(
         output_dir, f"debug_summary_{prefix}{video_hash[:8]}_{param_fingerprint}.md")
 
