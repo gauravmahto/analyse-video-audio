@@ -16,11 +16,13 @@ venv/
 
 # Media and extracted frames
 *.mp4
+*.pdf
 frames/
 extracted_frames/
 
 # Pipelines/cache
 .pipeline_cache/
+.medical_cache/
 
 logs/
 output/
