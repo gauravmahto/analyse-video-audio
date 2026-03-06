@@ -23,7 +23,8 @@ python medical_pipeline.py \
   --main-urls http://127.0.0.1:8033/v1/chat/completions:3 \
   --synthesis-model qwen3.5-35b \
   --synthesis-url http://127.0.0.1:8034/v1/chat/completions \
-  --export-dir ./medical_exports/
+  --export-dir ./medical_exports/ \
+  --compress-context
 
 ./llama-server \
   -hf unsloth/Qwen3.5-35B-A3B-GGUF:Q6_K \
@@ -50,6 +51,7 @@ import threading
 import queue
 import json
 import re
+import copy
 
 from pdf2image import convert_from_path
 from PIL import Image
@@ -127,17 +129,20 @@ def setup_cache(doc_hash, model_name, synthesis_model_name):
     pages_dir = os.path.join(cache_dir, "pages_cas")
     os.makedirs(pages_dir, exist_ok=True)
     prompt_hash = hashlib.md5(VISION_PROMPT.encode('utf-8')).hexdigest()[:6]
-    fingerprint = f"{model_name}_{synthesis_model_name}_p{prompt_hash}"
+
+    # Phase 1: PDF-to-Image manifest ONLY depends on the document hash, not the models.
+    manifest_file = os.path.join(cache_dir, "page_manifest.json")
+
+    # Phase 2 & 3: Extracted JSON data depends on the Vision model and prompt, NOT the synthesis text model.
+    vlm_fingerprint = f"{model_name}_p{prompt_hash}"
 
     return {
         "dir": cache_dir,
         "pages_dir": pages_dir,
-        "page_manifest": os.path.join(cache_dir, f"page_manifest_{fingerprint}.json"),
-        "extracted_data": os.path.join(cache_dir, f"extracted_data_{fingerprint}.json"),
-        "final_timeline": os.path.join(cache_dir, f"final_timeline_{fingerprint}.json")
+        "page_manifest": manifest_file,
+        "extracted_data": os.path.join(cache_dir, f"extracted_data_{vlm_fingerprint}.json"),
+        "final_timeline": os.path.join(cache_dir, f"final_timeline_{vlm_fingerprint}.json")
     }
-
-# --- THE FIX: Increased timeout to 600 seconds and added reasoning_content parser ---
 
 
 def robust_api_call(url, payload, max_retries=3, timeout=600):
@@ -149,22 +154,14 @@ def robust_api_call(url, payload, max_retries=3, timeout=600):
             response.raise_for_status()
 
             data = response.json()
-            message = data["choices"][0].get("message", {})
 
-            # llama.cpp separates "thoughts" into reasoning_content for DeepSeek/Qwen reasoning models
-            reasoning = message.get("reasoning_content", "")
-            content = message.get("content", "")
+            # llama.cpp puts both the <think> block and the final answer inside 'content'
+            content = data["choices"][0].get("message", {}).get("content", "")
             if content is None:
                 content = ""
 
-            # Combine them so the rest of the script (and the user) can see the thoughts
-            final_text = ""
-            if reasoning:
-                final_text += f"<think>\n{reasoning}\n</think>\n\n"
-            final_text += content
-
             duration = time.time() - start_time
-            return final_text, duration
+            return content, duration
         except requests.exceptions.RequestException as e:
             error_details = f" | Server Details: {e.response.text}" if hasattr(
                 e, 'response') and e.response else ""
@@ -397,7 +394,58 @@ def interpolate_and_sort_dates(raw_data, paths):
     return sorted_timeline
 
 
-def interactive_qa_loop(timeline_data, synthesis_url, synthesis_model, export_dir, bundle_hash):
+# --- NEW: Intelligent Deduplication & Compression Engine ---
+def intelligent_compress_text(text, global_seen_lines):
+    if not text or not isinstance(text, str):
+        return text
+
+    # 1. Strip excessive repeating characters (OCR artifacts: "-------", "........")
+    text = re.sub(r'([.\-_= *~#])\1{3,}', r'\1\1\1', text)
+
+    # 2. Remove consecutive repeated words (e.g., "the the the patient")
+    text = re.sub(r'\b(\w+)(?:\s+\1\b)+', r'\1', text, flags=re.IGNORECASE)
+
+    # 3. Reduce excessive whitespaces
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+
+    # 4. Global Line Deduplication (Targeting boilerplate headers, footers, disclaimers across pages)
+    lines = text.split('\n')
+    deduped_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Only deduplicate lines longer than 30 characters to avoid breaking valid short data
+        if len(stripped) > 30:
+            # Normalize: remove punctuation and lowercase for strict duplicate matching
+            normalized = re.sub(r'[^\w\s]', '', stripped.lower())
+            if normalized not in global_seen_lines:
+                global_seen_lines.add(normalized)
+                deduped_lines.append(stripped)
+        else:
+            if stripped:  # Avoid keeping completely empty lines to further compress
+                deduped_lines.append(stripped)
+
+    return '\n'.join(deduped_lines).strip()
+
+
+def compress_timeline(timeline):
+    global_seen_lines = set()
+
+    def process_node(node):
+        if isinstance(node, dict):
+            return {k: process_node(v) for k, v in node.items()}
+        elif isinstance(node, list):
+            # Process lists and remove any empty items
+            return [process_node(item) for item in node if item or isinstance(item, (int, bool, float))]
+        elif isinstance(node, str):
+            return intelligent_compress_text(node, global_seen_lines)
+        else:
+            return node
+
+    return process_node(timeline)
+# -----------------------------------------------------------
+
+
+def interactive_qa_loop(timeline_data, synthesis_url, synthesis_model, export_dir, bundle_hash, compress_context):
     """Boots a REPL loop to chat with the heavy LLM about the patient timeline."""
 
     chat_log_path = os.path.join(
@@ -409,11 +457,28 @@ def interactive_qa_loop(timeline_data, synthesis_url, synthesis_model, export_di
     print(
         f"Connecting to Coordinator Model ({synthesis_model}) on {synthesis_url}")
     print(f"Live chat transcript will be saved to: {chat_log_path}")
+
+    # Process Context Compression based on the CLI flag
+    if compress_context:
+        print("🗜️ Context Compression: ENABLED (Intelligent Regex Deduplication & OCR Noise Reduction)")
+        original_size = len(json.dumps(timeline_data))
+
+        # We recursively deduplicate sentences across ALL pages without deleting the clinical notes!
+        timeline_to_use = compress_timeline(copy.deepcopy(timeline_data))
+
+        new_size = len(json.dumps(timeline_to_use))
+        savings = 100 - ((new_size / original_size) *
+                         100) if original_size > 0 else 0
+        print(f"📉 Compressed timeline payload size by {savings:.1f}%")
+    else:
+        print("🗜️ Context Compression: DISABLED (Sending full uncompressed OCR text)")
+        timeline_to_use = timeline_data
+
     print("You may now ask questions about the patient's medical history.")
     print("Type 'exit' or 'quit' to end the session.\n")
 
-    # Convert the massive JSON into a readable string for the system prompt
-    context_string = json.dumps(timeline_data, indent=2)
+    # Convert the chosen JSON into a readable string for the system prompt
+    context_string = json.dumps(timeline_to_use, indent=2)
 
     system_prompt = f"""You are an expert Chief Medical Officer analyzing a patient's historical medical records.
 The records have been extracted via OCR and sorted chronologically below.
@@ -444,20 +509,20 @@ PATIENT MEDICAL TIMELINE (JSON):
             }
 
             print("Thinking...")
-            # --- THE FIX: Increased loop timeout to 600s so it doesn't interrupt the server ---
             response_text, duration = robust_api_call(
                 synthesis_url, payload, timeout=600)
 
             chat_history.append(
                 {"role": "assistant", "content": response_text})
 
-            # --- THE ULTIMATE UI FIX ---
-            # Use raw unadulterated string prints. No strict markdown parsers to swallow unclosed tags.
+            # Safely replace the tags for the terminal view
             display_text = response_text.replace(
                 "<think>", "\n[🧠 SYSTEM THINKING]\n-------------------\n").replace("</think>", "\n-------------------\n\n")
+
+            # Print using raw print to guarantee visibility, bypassing rich.Markdown completely
             print(f"\n{display_text}")
 
-            # --- NEW: Append to chat transcript file ---
+            # Append to chat transcript file
             with open(chat_log_path, "a", encoding="utf-8") as f:
                 f.write(f"### 🩺 Question: {user_question}\n\n")
                 f.write(f"**🤖 Answer:**\n{response_text}\n\n---\n\n")
@@ -495,6 +560,9 @@ def main():
     parser.add_argument("--export-dir", type=str, default="./medical_exports",
                         help="Directory to save the final extracted JSON and chat transcripts.")
 
+    parser.add_argument("--compress-context", action="store_true",
+                        help="Intelligently compress the timeline by stripping OCR noise and duplicate sentences.")
+
     args = parser.parse_args()
 
     # --- Initial Setup ---
@@ -504,16 +572,13 @@ def main():
     actual_pdf_paths = []
     for path in args.pdfs:
         if os.path.isdir(path):
-            # Search for PDFs recursively in the directory
             actual_pdf_paths.extend(
                 glob.glob(os.path.join(path, '**', '*.pdf'), recursive=True))
         elif os.path.isfile(path):
             actual_pdf_paths.append(path)
         else:
-            # Handle unexpanded wildcards gracefully
             actual_pdf_paths.extend(glob.glob(path, recursive=True))
 
-    # Deduplicate paths and sort them
     actual_pdf_paths = sorted(list(set(actual_pdf_paths)))
 
     if not actual_pdf_paths:
@@ -565,7 +630,7 @@ def main():
 
     # --- Phase 4: Interactive Analysis ---
     interactive_qa_loop(timeline_data, args.synthesis_url,
-                        args.synthesis_model, args.export_dir, bundle_hash)
+                        args.synthesis_model, args.export_dir, bundle_hash, args.compress_context)
 
 
 if __name__ == "__main__":
