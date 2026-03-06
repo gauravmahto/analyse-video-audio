@@ -22,13 +22,14 @@ python medical_pipeline.py \
   --model qwen3-vl \
   --main-urls http://127.0.0.1:8033/v1/chat/completions:3 \
   --synthesis-model qwen3.5-35b \
-  --synthesis-url http://127.0.0.1:8034/v1/chat/completions
+  --synthesis-url http://127.0.0.1:8034/v1/chat/completions \
+  --export-dir ./medical_exports/
 
 ./llama-server \
   -hf unsloth/Qwen3.5-35B-A3B-GGUF:Q6_K \
   --host 0.0.0.0 --port 8034 \
   -ngl 999 -fa on \
-  -c 80000 \
+  -c 145000 \
   -b 1024 \
   -ub 1024 \
   -np 1
@@ -57,7 +58,6 @@ try:
     from rich.live import Live
     from rich.table import Table
     from rich.console import Console
-    from rich.markdown import Markdown
     RICH_AVAILABLE = True
     console = Console()
 except ImportError:
@@ -137,8 +137,10 @@ def setup_cache(doc_hash, model_name, synthesis_model_name):
         "final_timeline": os.path.join(cache_dir, f"final_timeline_{fingerprint}.json")
     }
 
+# --- THE FIX: Increased timeout to 600 seconds and added reasoning_content parser ---
 
-def robust_api_call(url, payload, max_retries=3, timeout=180):
+
+def robust_api_call(url, payload, max_retries=3, timeout=600):
     for attempt in range(max_retries):
         try:
             start_time = time.time()
@@ -147,9 +149,22 @@ def robust_api_call(url, payload, max_retries=3, timeout=180):
             response.raise_for_status()
 
             data = response.json()
-            content = data["choices"][0]["message"]["content"]
+            message = data["choices"][0].get("message", {})
+
+            # llama.cpp separates "thoughts" into reasoning_content for DeepSeek/Qwen reasoning models
+            reasoning = message.get("reasoning_content", "")
+            content = message.get("content", "")
+            if content is None:
+                content = ""
+
+            # Combine them so the rest of the script (and the user) can see the thoughts
+            final_text = ""
+            if reasoning:
+                final_text += f"<think>\n{reasoning}\n</think>\n\n"
+            final_text += content
+
             duration = time.time() - start_time
-            return content, duration
+            return final_text, duration
         except requests.exceptions.RequestException as e:
             error_details = f" | Server Details: {e.response.text}" if hasattr(
                 e, 'response') and e.response else ""
@@ -382,14 +397,18 @@ def interpolate_and_sort_dates(raw_data, paths):
     return sorted_timeline
 
 
-def interactive_qa_loop(timeline_data, synthesis_url, synthesis_model):
+def interactive_qa_loop(timeline_data, synthesis_url, synthesis_model, export_dir, bundle_hash):
     """Boots a REPL loop to chat with the heavy LLM about the patient timeline."""
+
+    chat_log_path = os.path.join(
+        export_dir, f"chat_transcript_{bundle_hash[:8]}.md")
 
     print("\n" + "="*70)
     print("🏥 MEDICAL TIMELINE SYNTHESIS COMPLETE")
     print("="*70)
     print(
         f"Connecting to Coordinator Model ({synthesis_model}) on {synthesis_url}")
+    print(f"Live chat transcript will be saved to: {chat_log_path}")
     print("You may now ask questions about the patient's medical history.")
     print("Type 'exit' or 'quit' to end the session.\n")
 
@@ -421,24 +440,27 @@ PATIENT MEDICAL TIMELINE (JSON):
                 "model": synthesis_model,
                 "messages": chat_history,
                 "temperature": 0.1,
-                "max_tokens": 4096
+                "max_tokens": 8192
             }
 
             print("Thinking...")
+            # --- THE FIX: Increased loop timeout to 600s so it doesn't interrupt the server ---
             response_text, duration = robust_api_call(
-                synthesis_url, payload, timeout=1800)
+                synthesis_url, payload, timeout=600)
 
             chat_history.append(
                 {"role": "assistant", "content": response_text})
 
-            # Make <think> tags visible so the rich Markdown parser doesn't hide them!
+            # --- THE ULTIMATE UI FIX ---
+            # Use raw unadulterated string prints. No strict markdown parsers to swallow unclosed tags.
             display_text = response_text.replace(
-                "<think>", "\n> **🧠 System Thinking:**\n> ").replace("</think>", "\n\n---\n")
+                "<think>", "\n[🧠 SYSTEM THINKING]\n-------------------\n").replace("</think>", "\n-------------------\n\n")
+            print(f"\n{display_text}")
 
-            if RICH_AVAILABLE:
-                console.print(Markdown(display_text))
-            else:
-                print(f"\n{display_text}")
+            # --- NEW: Append to chat transcript file ---
+            with open(chat_log_path, "a", encoding="utf-8") as f:
+                f.write(f"### 🩺 Question: {user_question}\n\n")
+                f.write(f"**🤖 Answer:**\n{response_text}\n\n---\n\n")
 
         except KeyboardInterrupt:
             print("\nSession interrupted. Goodbye!")
@@ -454,7 +476,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Medical Document AI Pipeline")
     parser.add_argument("--pdfs", type=str, nargs='+', required=True,
-                        help="Path(s) to specific PDF files or folder(s) containing PDFs (e.g. ./patient_records/ file1.pdf).")
+                        help="Path(s) to one or more PDF medical records (e.g. file1.pdf file2.pdf or *.pdf).")
 
     parser.add_argument("--main-urls", type=str, nargs='+', default=[LLAMA_API_URL],
                         help="Worker LLM servers used for parallel Vision processing. Optional slot count: e.g. URL:4")
@@ -469,6 +491,9 @@ def main():
 
     parser.add_argument("--clear-cache", action="store_true",
                         help="Delete existing cache for this file batch.")
+
+    parser.add_argument("--export-dir", type=str, default="./medical_exports",
+                        help="Directory to save the final extracted JSON and chat transcripts.")
 
     args = parser.parse_args()
 
@@ -530,9 +555,17 @@ def main():
     # --- Phase 3: Temporal Interpolation ---
     timeline_data = interpolate_and_sort_dates(raw_extracted_data, paths)
 
+    # --- NEW: Export the data to a visible folder ---
+    os.makedirs(args.export_dir, exist_ok=True)
+    export_json_path = os.path.join(
+        args.export_dir, f"extracted_timeline_{bundle_hash[:8]}.json")
+    with open(export_json_path, "w", encoding="utf-8") as f:
+        json.dump(timeline_data, f, indent=4)
+    logger.info(f"💾 Exported readable patient timeline to: {export_json_path}")
+
     # --- Phase 4: Interactive Analysis ---
     interactive_qa_loop(timeline_data, args.synthesis_url,
-                        args.synthesis_model)
+                        args.synthesis_model, args.export_dir, bundle_hash)
 
 
 if __name__ == "__main__":

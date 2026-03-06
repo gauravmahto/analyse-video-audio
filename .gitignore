@@ -27,5 +27,6 @@ extracted_frames/
 logs/
 output/
 input/
+medical_exports/
 
 .DS_Store
