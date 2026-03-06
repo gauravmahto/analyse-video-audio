@@ -26,5 +26,6 @@ extracted_frames/
 
 logs/
 output/
+input/
 
 .DS_Store

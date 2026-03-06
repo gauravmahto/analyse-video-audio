@@ -18,7 +18,7 @@ Key Features:
 =====================================================
 
 python medical_pipeline.py \
-  --pdfs *.pdf \
+  --pdfs ./patient_folder/ \
   --model qwen3-vl \
   --main-urls http://127.0.0.1:8033/v1/chat/completions:3 \
   --synthesis-model qwen3.5-35b \
@@ -454,7 +454,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Medical Document AI Pipeline")
     parser.add_argument("--pdfs", type=str, nargs='+', required=True,
-                        help="Path(s) to one or more PDF medical records (e.g. file1.pdf file2.pdf or *.pdf).")
+                        help="Path(s) to specific PDF files or folder(s) containing PDFs (e.g. ./patient_records/ file1.pdf).")
 
     parser.add_argument("--main-urls", type=str, nargs='+', default=[LLAMA_API_URL],
                         help="Worker LLM servers used for parallel Vision processing. Optional slot count: e.g. URL:4")
@@ -475,14 +475,36 @@ def main():
     # --- Initial Setup ---
     main_parsed = parse_url_args(args.main_urls, default_slots=1)
 
+    # --- Handle Directory & File Parsing ---
+    actual_pdf_paths = []
+    for path in args.pdfs:
+        if os.path.isdir(path):
+            # Search for PDFs recursively in the directory
+            actual_pdf_paths.extend(
+                glob.glob(os.path.join(path, '**', '*.pdf'), recursive=True))
+        elif os.path.isfile(path):
+            actual_pdf_paths.append(path)
+        else:
+            # Handle unexpanded wildcards gracefully
+            actual_pdf_paths.extend(glob.glob(path, recursive=True))
+
+    # Deduplicate paths and sort them
+    actual_pdf_paths = sorted(list(set(actual_pdf_paths)))
+
+    if not actual_pdf_paths:
+        logger.error(
+            "❌ No PDF files found in the specified paths or directories.")
+        sys.exit(1)
+
     # Create a single combined hash representing ALL inputted PDFs
-    bundle_hash = get_combined_hash(args.pdfs)
+    bundle_hash = get_combined_hash(actual_pdf_paths)
     if not bundle_hash:
-        logger.error("❌ One or more files not found.")
+        logger.error("❌ Failed to hash the provided files.")
         sys.exit(1)
 
     logger.info("=== Starting Medical Document AI Pipeline ===")
-    logger.info(f"Target Files: {len(args.pdfs)} PDF(s) provided.")
+    logger.info(
+        f"Target Files: {len(actual_pdf_paths)} PDF(s) found and loaded.")
     logger.info(f"Patient Bundle Hash: {bundle_hash[:12]}")
     logger.info(
         f"Vision Workers: {sum(slots for url, slots in main_parsed)} slots mapped to {args.model}")
@@ -499,7 +521,7 @@ def main():
 
     # --- Phase 1: Multi-PDF to CAS Extraction ---
     manifest = extract_pdfs_to_cas(
-        args.pdfs, paths["pages_dir"], paths["page_manifest"])
+        actual_pdf_paths, paths["pages_dir"], paths["page_manifest"])
 
     # --- Phase 2: VLM JSON Extraction ---
     raw_extracted_data = process_medical_images(
