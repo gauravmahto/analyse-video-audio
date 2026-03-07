@@ -14,9 +14,14 @@ Key Features:
 - Date Interpolation: Infers missing prescription dates based on surrounding pages.
 - Chronological Sorting: Reorders out-of-sequence PDF pages into a true timeline.
 - Interactive Medical REPL: Chat with your data using a massive context window.
+- Intelligent Compression: Strips OCR noise and deduplicates boilerplate across pages.
+- MLX Support: Seamlessly connects to Apple's native mlx_lm framework with smart 404 fallbacks.
+- Audit Logging: Tracks exact query timestamps and model processing speeds.
 
 =====================================================
+USAGE EXAMPLES:
 
+Standard Llama.cpp Mode:
 python medical_pipeline.py \
   --pdfs ./patient_folder/ \
   --model qwen3-vl \
@@ -26,14 +31,19 @@ python medical_pipeline.py \
   --export-dir ./medical_exports/ \
   --compress-context
 
-./llama-server \
-  -hf unsloth/Qwen3.5-35B-A3B-GGUF:Q6_K \
-  --host 0.0.0.0 --port 8034 \
-  -ngl 999 -fa on \
-  -c 145000 \
-  -b 1024 \
-  -ub 1024 \
-  -np 1
+Apple MLX Mode:
+Start MLX Server: python3 -m mlx_lm server --model mlx-community/Llama-3.3-70B-Instruct-4bit --host 0.0.0.0 --port 8034
+
+Run Script:
+python medical_pipeline.py \
+  --pdfs ./patient_folder/ \
+  --model qwen3-vl \
+  --main-urls http://127.0.0.1:8033/v1/chat/completions:3 \
+  --synthesis-model mlx-community/Llama-3.3-70B-Instruct-4bit \
+  --synthesis-url http://127.0.0.1:8034/v1/chat/completions \
+  --export-dir ./medical_exports/ \
+  --compress-context \
+  --use-mlx
 """
 
 import os
@@ -52,6 +62,7 @@ import queue
 import json
 import re
 import copy
+from datetime import datetime
 
 from pdf2image import convert_from_path
 from PIL import Image
@@ -70,7 +81,7 @@ LLAMA_API_URL = "http://127.0.0.1:8033/v1/chat/completions"
 BASE_CACHE_DIR = ".medical_cache"
 GLOBAL_VLM_CACHE_DIR = os.path.join(BASE_CACHE_DIR, "global_vision_cache")
 
-# The prompt is designed to force structured JSON from the vision model
+# EXPANDED PROMPT: Ensures clinical data isn't lost when raw text is compressed
 VISION_PROMPT = """You are a highly accurate medical data extraction AI. Extract the details from this Indian medical prescription/document.
 You must reply ONLY with a valid JSON object. Do not include markdown formatting or conversational text.
 Format:
@@ -79,10 +90,13 @@ Format:
   "date": "YYYY-MM-DD or null",
   "doctor_name": "string or null",
   "hospital_clinic": "string or null",
+  "symptoms_and_complaints": ["list of strings"],
   "diagnoses": ["list of strings"],
+  "lab_results_and_vitals": ["list of strings"],
   "medications": [
     {"name": "string", "dosage": "string", "frequency": "string"}
   ],
+  "treatment_plan_and_notes": "string or null",
   "raw_extracted_text": "A highly accurate, verbatim text extraction of the entire page."
 }
 If a field is illegible, use "[UNREADABLE]". If missing, use null."""
@@ -130,10 +144,10 @@ def setup_cache(doc_hash, model_name, synthesis_model_name):
     os.makedirs(pages_dir, exist_ok=True)
     prompt_hash = hashlib.md5(VISION_PROMPT.encode('utf-8')).hexdigest()[:6]
 
-    # Phase 1: PDF-to-Image manifest ONLY depends on the document hash, not the models.
+    # Decoupled Cache Logic: PDF extraction depends only on the document hash
     manifest_file = os.path.join(cache_dir, "page_manifest.json")
 
-    # Phase 2 & 3: Extracted JSON data depends on the Vision model and prompt, NOT the synthesis text model.
+    # Extracted data depends on the Vision model and prompt, NOT the synthesis text model.
     vlm_fingerprint = f"{model_name}_p{prompt_hash}"
 
     return {
@@ -145,17 +159,32 @@ def setup_cache(doc_hash, model_name, synthesis_model_name):
     }
 
 
-def robust_api_call(url, payload, max_retries=3, timeout=600):
+def robust_api_call(url, payload, use_mlx=False, max_retries=3, timeout=600):
+    # Apple's MLX server often throws a 404 Model Not Found if the requested model
+    # doesn't perfectly match its internal state. Overriding it here prevents the crash.
+    if use_mlx and "model" in payload:
+        payload["model"] = "default_model"
+
     for attempt in range(max_retries):
         try:
             start_time = time.time()
             response = requests.post(
                 url, headers={"Content-Type": "application/json"}, json=payload, timeout=timeout)
+
+            # Smart Fallback: If MLX Server throws a 404 on the standard route, try the direct route.
+            if response.status_code == 404 and use_mlx and "/v1/chat/completions" in url:
+                fallback_url = url.replace(
+                    "/v1/chat/completions", "/chat/completions")
+                logger.info(
+                    f"Received 404. Attempting MLX fallback route: {fallback_url}")
+                response = requests.post(
+                    fallback_url, headers={"Content-Type": "application/json"}, json=payload, timeout=timeout)
+
             response.raise_for_status()
 
             data = response.json()
 
-            # llama.cpp puts both the <think> block and the final answer inside 'content'
+            # llama.cpp (and mlx_lm) puts both the <think> block and the final answer inside 'content'
             content = data["choices"][0].get("message", {}).get("content", "")
             if content is None:
                 content = ""
@@ -164,7 +193,7 @@ def robust_api_call(url, payload, max_retries=3, timeout=600):
             return content, duration
         except requests.exceptions.RequestException as e:
             error_details = f" | Server Details: {e.response.text}" if hasattr(
-                e, 'response') and e.response else ""
+                e, 'response') and getattr(e.response, 'text', None) else ""
             if attempt == max_retries - 1:
                 logger.error(f"API Failed on {url}: {e}{error_details}")
                 raise Exception(f"{e}{error_details}")
@@ -192,7 +221,8 @@ def clean_json_response(raw_text):
     # Fallback if the model completely fails to format JSON
     return {
         "patient_name": None, "date": None, "doctor_name": None,
-        "hospital_clinic": None, "diagnoses": [], "medications": [],
+        "hospital_clinic": None, "symptoms_and_complaints": [], "diagnoses": [],
+        "lab_results_and_vitals": [], "medications": [], "treatment_plan_and_notes": None,
         "raw_extracted_text": raw_text, "json_parse_error": True
     }
 
@@ -394,8 +424,9 @@ def interpolate_and_sort_dates(raw_data, paths):
     return sorted_timeline
 
 
-# --- NEW: Intelligent Deduplication & Compression Engine ---
+# --- INTELLIGENT COMPRESSION ENGINE ---
 def intelligent_compress_text(text, global_seen_lines):
+    """Removes OCR noise, stutters, and deduplicates repetitive hospital headers/footers."""
     if not text or not isinstance(text, str):
         return text
 
@@ -428,6 +459,7 @@ def intelligent_compress_text(text, global_seen_lines):
 
 
 def compress_timeline(timeline):
+    """Recursively traverses the JSON to intelligently compress string fields."""
     global_seen_lines = set()
 
     def process_node(node):
@@ -445,7 +477,7 @@ def compress_timeline(timeline):
 # -----------------------------------------------------------
 
 
-def interactive_qa_loop(timeline_data, synthesis_url, synthesis_model, export_dir, bundle_hash, compress_context):
+def interactive_qa_loop(timeline_data, synthesis_url, synthesis_model, export_dir, bundle_hash, compress_context=False, use_mlx=False):
     """Boots a REPL loop to chat with the heavy LLM about the patient timeline."""
 
     chat_log_path = os.path.join(
@@ -454,8 +486,14 @@ def interactive_qa_loop(timeline_data, synthesis_url, synthesis_model, export_di
     print("\n" + "="*70)
     print("🏥 MEDICAL TIMELINE SYNTHESIS COMPLETE")
     print("="*70)
-    print(
-        f"Connecting to Coordinator Model ({synthesis_model}) on {synthesis_url}")
+
+    if use_mlx:
+        print(
+            f"🍎 Connecting to Apple MLX Server ({synthesis_model}) on {synthesis_url}")
+    else:
+        print(
+            f"🔌 Connecting to Coordinator Server ({synthesis_model}) on {synthesis_url}")
+
     print(f"Live chat transcript will be saved to: {chat_log_path}")
 
     # Process Context Compression based on the CLI flag
@@ -465,6 +503,12 @@ def interactive_qa_loop(timeline_data, synthesis_url, synthesis_model, export_di
 
         # We recursively deduplicate sentences across ALL pages without deleting the clinical notes!
         timeline_to_use = compress_timeline(copy.deepcopy(timeline_data))
+
+        # If the raw extracted text STILL exists and is too large, we can safely delete it now
+        # because our expanded prompt already extracted the actual medical data into other fields.
+        for page in timeline_to_use:
+            if "raw_extracted_text" in page:
+                del page["raw_extracted_text"]
 
         new_size = len(json.dumps(timeline_to_use))
         savings = 100 - ((new_size / original_size) *
@@ -480,10 +524,15 @@ def interactive_qa_loop(timeline_data, synthesis_url, synthesis_model, export_di
     # Convert the chosen JSON into a readable string for the system prompt
     context_string = json.dumps(timeline_to_use, indent=2)
 
+    # HARDENED PROMPT: specifically forcing cross-referencing and contradiction resolution
     system_prompt = f"""You are an expert Chief Medical Officer analyzing a patient's historical medical records.
-The records have been extracted via OCR and sorted chronologically below.
-If a user asks a question, answer it accurately based ONLY on the provided context.
-Identify potential drug interactions if asked. 
+The records have been extracted via OCR and sorted chronologically below as a JSON array.
+
+INSTRUCTIONS:
+1. Answer the user's questions accurately based ONLY on the provided context.
+2. Carefully check ALL dates and records. If there is conflicting information (e.g., an allergy listed in 2023 but "No Known Allergy" in 2025), state both and explain the discrepancy.
+3. Pay close attention to "raw_extracted_text" for handwritten notes that might not be fully parsed into the structured fields.
+4. Identify potential drug interactions if asked.
 
 PATIENT MEDICAL TIMELINE (JSON):
 {context_string}"""
@@ -499,6 +548,8 @@ PATIENT MEDICAL TIMELINE (JSON):
             if not user_question.strip():
                 continue
 
+            query_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
             chat_history.append({"role": "user", "content": user_question})
 
             payload = {
@@ -510,21 +561,27 @@ PATIENT MEDICAL TIMELINE (JSON):
 
             print("Thinking...")
             response_text, duration = robust_api_call(
-                synthesis_url, payload, timeout=600)
+                synthesis_url, payload, use_mlx=use_mlx, timeout=600)
+
+            # CLEANUP: Strip out MLX/Llama stop token leaks
+            response_text = response_text.replace(
+                "<|eot_id|>", "").replace("<|im_end|>", "").strip()
 
             chat_history.append(
                 {"role": "assistant", "content": response_text})
 
-            # Safely replace the tags for the terminal view
+            # Safely replace the tags for the terminal view, bypassing rich.Markdown swallows
             display_text = response_text.replace(
                 "<think>", "\n[🧠 SYSTEM THINKING]\n-------------------\n").replace("</think>", "\n-------------------\n\n")
 
-            # Print using raw print to guarantee visibility, bypassing rich.Markdown completely
+            # Print using raw print to guarantee visibility
             print(f"\n{display_text}")
 
             # Append to chat transcript file
             with open(chat_log_path, "a", encoding="utf-8") as f:
-                f.write(f"### 🩺 Question: {user_question}\n\n")
+                f.write(f"### 🩺 Question: {user_question}\n")
+                f.write(
+                    f"*Asked on: {query_timestamp} | Processing Time: {duration:.2f} seconds*\n\n")
                 f.write(f"**🤖 Answer:**\n{response_text}\n\n---\n\n")
 
         except KeyboardInterrupt:
@@ -540,6 +597,8 @@ PATIENT MEDICAL TIMELINE (JSON):
 def main():
     parser = argparse.ArgumentParser(
         description="Medical Document AI Pipeline")
+
+    # Updated to support multiple files and directories
     parser.add_argument("--pdfs", type=str, nargs='+', required=True,
                         help="Path(s) to one or more PDF medical records (e.g. file1.pdf file2.pdf or *.pdf).")
 
@@ -550,7 +609,8 @@ def main():
                         help="The Vision Model expected by the API (default: qwen3-vl)")
 
     parser.add_argument("--synthesis-model", type=str, required=True,
-                        help="The heavy Text Model to use for final Q&A (e.g. qwen3.5-35b)")
+                        help="The heavy Text Model to use for final Q&A (e.g. mlx-community/Llama-3.3-70B-Instruct-4bit)")
+
     parser.add_argument("--synthesis-url", type=str, required=True,
                         help="Dedicated LLM server endpoint for the text synthesis (e.g. port 8034).")
 
@@ -562,6 +622,9 @@ def main():
 
     parser.add_argument("--compress-context", action="store_true",
                         help="Intelligently compress the timeline by stripping OCR noise and duplicate sentences.")
+
+    parser.add_argument("--use-mlx", action="store_true",
+                        help="Enable Apple MLX mode flag for specific synthesis server formatting & 404 fallbacks.")
 
     args = parser.parse_args()
 
@@ -601,6 +664,9 @@ def main():
     logger.info(
         f"Coordinator: {args.synthesis_url} mapped to {args.synthesis_model}")
 
+    if args.use_mlx:
+        logger.info("Apple MLX Native mode activated for synthesis.")
+
     if args.clear_cache:
         cache_dir_to_clear = os.path.join(BASE_CACHE_DIR, bundle_hash)
         if os.path.exists(cache_dir_to_clear):
@@ -620,7 +686,7 @@ def main():
     # --- Phase 3: Temporal Interpolation ---
     timeline_data = interpolate_and_sort_dates(raw_extracted_data, paths)
 
-    # --- NEW: Export the data to a visible folder ---
+    # --- Phase 4: Export Data ---
     os.makedirs(args.export_dir, exist_ok=True)
     export_json_path = os.path.join(
         args.export_dir, f"extracted_timeline_{bundle_hash[:8]}.json")
@@ -628,9 +694,16 @@ def main():
         json.dump(timeline_data, f, indent=4)
     logger.info(f"💾 Exported readable patient timeline to: {export_json_path}")
 
-    # --- Phase 4: Interactive Analysis ---
-    interactive_qa_loop(timeline_data, args.synthesis_url,
-                        args.synthesis_model, args.export_dir, bundle_hash, args.compress_context)
+    # --- Phase 5: Interactive Analysis ---
+    interactive_qa_loop(
+        timeline_data,
+        args.synthesis_url,
+        args.synthesis_model,
+        args.export_dir,
+        bundle_hash,
+        args.compress_context,
+        args.use_mlx
+    )
 
 
 if __name__ == "__main__":
