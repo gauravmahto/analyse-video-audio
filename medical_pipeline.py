@@ -189,6 +189,14 @@ def robust_api_call(url, payload, use_mlx=False, max_retries=3, timeout=600):
             if content is None:
                 content = ""
 
+            if not str(content).strip():
+                logger.warning(
+                    "Empty response content returned from %s for model %s. Raw API response: %s",
+                    url,
+                    payload.get("model", "unknown"),
+                    json.dumps(data, ensure_ascii=False)
+                )
+
             duration = time.time() - start_time
             return content, duration
         except requests.exceptions.RequestException as e:
