@@ -237,6 +237,13 @@ FRAME_LIMIT = 100              # Analyze first N frames
 
 ### 1. Install Python Dependencies
 
+Create and activate a virtual environment first:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -287,13 +294,27 @@ ffmpeg -version
 **For Medical Pipeline (Split Architecture)**:
 
 ```bash
-# Vision model (small, fast)
-./llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q8_0 \
-  --host 127.0.0.1 --port 8033 -ngl 99 -c 8192 -np 4
+# Phase 1: Vision extraction server
+./llama-server \
+  -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q8_0 \
+  --host 127.0.0.1 --port 8033 \
+  -ngl 999 \
+  -fa on \
+  -c 45000 \
+  -b 1024 \
+  -ub 1024 \
+  -np 1
 
-# Text synthesis model (large, powerful)
-./llama-server -hf unsloth/Qwen3.5-35B-A3B-GGUF:Q6_K \
-  --host 127.0.0.1 --port 8034 -ngl 999 -c 80000 -np 1
+# Phase 2: Text synthesis server (start after extraction has been cached)
+./llama-server \
+  -hf unsloth/Qwen3.5-35B-A3B-GGUF:Q6_K \
+  --host 0.0.0.0 --port 8034 \
+  -ngl 999 -fa on \
+  -c 245000 \
+  -b 4096 \
+  -ub 4096 \
+  -np 2 \
+  --jinja
 ```
 
 ---
@@ -316,19 +337,28 @@ python analyze_pipeline.py --video path/to/video.mp4 --phash-threshold 5
 ### Process Medical Prescriptions
 
 ```bash
-# Single PDF
-python medical_pipeline.py --pdfs prescription.pdf
-
-# Entire folder
-python medical_pipeline.py --pdfs ./patient_records/
-
-# With custom models
+# First run: extract and build cache
 python medical_pipeline.py \
-  --pdfs ./records/ \
+  --pdfs ./input/medical/me/ \
   --model qwen3-vl \
+  --main-urls http://127.0.0.1:8033/v1/chat/completions:3 \
   --synthesis-model qwen3.5-35b \
-  --synthesis-url http://127.0.0.1:8034/v1/chat/completions
+  --synthesis-url http://127.0.0.1:8034/v1/chat/completions \
+  --export-dir ./medical_exports/ \
+  --clear-cache
+
+# Second run: reuse cached extraction and open chat with the heavy text model
+python medical_pipeline.py \
+  --pdfs ./input/medical/me/ \
+  --model qwen3-vl \
+  --main-urls http://127.0.0.1:8033/v1/chat/completions:3 \
+  --synthesis-model qwen3.5-35b \
+  --synthesis-url http://127.0.0.1:8034/v1/chat/completions \
+  --export-dir ./medical_exports/
 ```
+
+Use `--clear-cache` only when you want to force a fresh extraction. On repeat runs, the pipeline reuses the cached structured extraction for the same PDF bundle and vision prompt.
+If the structured extraction cache already exists, the rerun does not call the vision workers before entering the synthesis/chat phase.
 
 ### Visualize Frame Selection
 
@@ -517,13 +547,32 @@ python medical_pipeline.py --pdfs ./patient_records/
 #### With Split Architecture
 
 ```bash
+# Pass 1: run with the vision server on 8033 and force fresh extraction
 python medical_pipeline.py \
-  --pdfs ./medical_docs/ \
+  --pdfs ./input/medical/me/ \
   --model qwen3-vl \
   --main-urls http://127.0.0.1:8033/v1/chat/completions:3 \
   --synthesis-model qwen3.5-35b \
-  --synthesis-url http://127.0.0.1:8034/v1/chat/completions
+  --synthesis-url http://127.0.0.1:8034/v1/chat/completions \
+  --export-dir ./medical_exports/ \
+  --clear-cache
+
+# Pass 2: after extraction is cached, start the non-vision model on 8034
+# and rerun the same command without --clear-cache to go directly into chat
+python medical_pipeline.py \
+  --pdfs ./input/medical/me/ \
+  --model qwen3-vl \
+  --main-urls http://127.0.0.1:8033/v1/chat/completions:3 \
+  --synthesis-model qwen3.5-35b \
+  --synthesis-url http://127.0.0.1:8034/v1/chat/completions \
+  --export-dir ./medical_exports/
 ```
+
+Why this works:
+
+- PDF page extraction is cached by document bundle hash.
+- Structured VLM extraction is cached by the vision model and prompt, not the synthesis model.
+- On the second run, if the extraction cache exists, the pipeline skips VLM extraction and reuses the cached timeline before launching the interactive Q&A loop.
 
 #### Interactive Q&A Session
 
