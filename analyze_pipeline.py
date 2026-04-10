@@ -77,7 +77,9 @@ BASE_CACHE_DIR = ".pipeline_cache"
 GLOBAL_VLM_CACHE_DIR = os.path.join(BASE_CACHE_DIR, "global_vlm_cache")
 
 # Defined globally so it can be securely injected into the CAS hash key
-VISUAL_PROMPT = "Describe the active terminal command, code being edited, or UI navigation happening in this exact frame. Use a maximum of 25 words. Be extremely concise. Do not use conversational filler like 'The screen shows' or 'Based on the image'."
+VISUAL_PROMPT = ("Extract every visible artifact in this frame verbatim. Report: file paths, YAML/JSON keys and their exact values, "
+    "variable names and their assigned values, version numbers, flags, role names, and any visible identifiers. "
+    "If a config block is shown, transcribe it faithfully. Max 60 words. No conversational filler.")
 
 # --- Setup Base Logging ---
 os.makedirs("logs", exist_ok=True)
@@ -744,11 +746,27 @@ def synthesize_timeline(transcript, visual_log, synthesis_api_url, model_name="q
     2. VISUAL TERMINAL LOG (Deduplicated for unique state changes):
     {visual_text}
     
-    Please analyze both timelines together. 
-    - Summarize the overall goal of the session.
-    - Match spoken context with technical execution seen on screen.
-    - Identify if there were any errors, warnings, or bottlenecks.
-    - Create a detailed steps covered from start to end which can be referred instead of watching the complete video.
+    Using BOTH timelines, produce output in exactly the following structure. Do NOT add any other sections.
+
+    ## Required steps extracted from the video
+    A numbered list of concrete, actionable implementation steps.
+    Rules:
+    - Every step must be grounded in something explicitly visible on screen or stated in audio.
+    - Include exact file paths, YAML keys, variable names, operator names, version bounds, flag names, and role names as they appear.
+    - Where multiple sub-items belong to one step (e.g. a list of variables passed to a role), use indented bullet points and list EVERY item — do not truncate or say "etc." or "and others".
+    - When a code block shows existing variables that must be kept unchanged, include a sub-bullet explicitly: "Keep the other existing vars in place, including: <list them>."
+    - Do NOT paraphrase values — copy them verbatim from the visual log when available.
+    - If a step or code snippet is referenced but only partially visible on screen, still include the step with a parenthetical note: "(note: not fully shown on screen — only X was visible)".
+    - Surface any prerequisite actions (dependency updates, version bumps, merges that must happen first) as their own numbered step, before the step that depends on them.
+    - If the speaker references a design document, spec page, or external resource by section name or URL, include a sub-bullet listing the referenced section names verbatim.
+
+    ## Key timeline
+    A bullet list of time ranges with one-line descriptions of the main activity in each range.
+    Format each line as: `MM:SS–MM:SS — <description>`
+    Rules:
+    - Create a new range every time the topic or on-screen content shifts, even within a minute.
+    - Prefer fine-grained ranges (30 seconds to 2 minutes) over coarse ones.
+    - Derive start/end times from the timestamps present in the visual log and transcript; interpolate where needed.
     """
 
     payload = {
